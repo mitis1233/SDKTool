@@ -270,12 +270,12 @@ public partial class VRCSdkControlPanel : EditorWindow, IVRCSdkPanelApi
         rootVisualElement.schedule.Execute(() =>
         {
             var currentPanel = VRCSettings.ActiveWindowPanel;
-            if (EditorApplication.isPlaying && currentPanel != 0)
-            {
-                VRCSettings.ActiveWindowPanel = 0;
-                RenderTabs();
-                return;
-            }
+            //if (EditorApplication.isPlaying && currentPanel != 0)
+            //{
+            //    VRCSettings.ActiveWindowPanel = 0;
+            //    RenderTabs();
+            //    return;
+            //}
             // Check that the tabs are enabled, if not - we must re-render tabs
             if (APIUser.IsLoggedIn && (!_tabButtons[1].enabledSelf || !_tabButtons[2].enabledSelf))
             {
@@ -301,17 +301,17 @@ public partial class VRCSdkControlPanel : EditorWindow, IVRCSdkPanelApi
             GUILayout.FlexibleSpace();
             GUILayout.BeginVertical();
         
-            if (Application.isPlaying)
-            {
-                GUI.enabled = false;
-                GUILayout.Space(20);
-                EditorGUILayout.LabelField("Unity Application is running ...\nStop it to access the Control Panel", titleGuiStyle, GUILayout.Width(SdkWindowWidth));
-                GUI.enabled = true;
-                GUILayout.EndVertical();
-                GUILayout.FlexibleSpace();
-                GUILayout.EndHorizontal();
-                return;
-            }
+            //if (Application.isPlaying)
+            //{
+            //    GUI.enabled = false;
+            //    GUILayout.Space(20);
+            //    EditorGUILayout.LabelField("Unity Application is running ...\nStop it to access the Control Panel", titleGuiStyle, GUILayout.Width(SdkWindowWidth));
+            //    GUI.enabled = true;
+            //    GUILayout.EndVertical();
+            //    GUILayout.FlexibleSpace();
+            //    GUILayout.EndHorizontal();
+            //    return;
+            //}
         
             EditorGUILayout.Space();
         
@@ -364,7 +364,7 @@ public partial class VRCSdkControlPanel : EditorWindow, IVRCSdkPanelApi
 
             _tabButtons[i].clicked += () =>
             {
-                if (EditorApplication.isPlaying) return;
+                //if (EditorApplication.isPlaying) return;
                 if (VRCSettings.ActiveWindowPanel == btnIndex)
                 {
                     return;

@@ -157,7 +157,7 @@ public partial class VRCSdkControlPanel : EditorWindow
 
     public void OnGUIError(Object subject, string output, System.Action show, System.Action fix)
     {
-        AddToReport(GUIErrors, subject, output, show, fix);
+        AddToReport(GUIWarnings, subject, output, show, fix);//修改
     }
 
     public void OnGUIWarning(Object subject, string output, System.Action show, System.Action fix)
