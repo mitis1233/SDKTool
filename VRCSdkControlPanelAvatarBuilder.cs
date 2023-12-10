@@ -1,33 +1,60 @@
-﻿using System;
+﻿#if !VRC_CLIENT
+using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Net;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
+using Cysharp.Threading.Tasks;
 using UnityEditor;
+using UnityEditor.Animations;
+using UnityEditor.SceneManagement;
+using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.SceneManagement;
+using UnityEngine.UIElements;
+using UnityEngine.UIElements.Experimental;
+using VRC.Core;
+using VRC.Editor;
+using VRC.SDKBase.Editor.Api;
+using VRC.SDKBase.Editor;
 using VRC.SDKBase.Editor.BuildPipeline;
+using VRC.SDKBase.Editor.Validation;
+using VRC.SDKBase.Validation;
 using VRC.SDKBase.Validation.Performance;
 using VRC.SDKBase.Validation.Performance.Stats;
+using VRC.SDK3.Avatars;
+using VRC.SDK3.Avatars.Components;
+using VRC.SDK3.Avatars.ScriptableObjects;
+using VRC.SDK3A.Editor;
+using VRC.SDK3A.Editor.Elements;
+using VRC.SDKBase;
+using VRC.SDKBase.Editor.Elements;
+using VRC.SDKBase.Editor.V3;
 using Object = UnityEngine.Object;
+using VRCStation = VRC.SDK3.Avatars.Components.VRCStation;
 
-namespace VRC.SDKBase.Editor
+[assembly: VRCSdkControlPanelBuilder(typeof(VRCSdkControlPanelAvatarBuilder))]
+namespace VRC.SDK3A.Editor
 {
-    public class VRCSdkControlPanelAvatarBuilder : IVRCSdkControlPanelBuilder
+    public class VRCSdkControlPanelAvatarBuilder : IVRCSdkAvatarBuilderApi
     {
+        private const int MAX_ACTION_TEXTURE_SIZE = 256;
+
         protected VRCSdkControlPanel _builder;
-        private VRC_AvatarDescriptor[] _avatars;
-        private static VRC_AvatarDescriptor _selectedAvatar;
-        private Vector2 _avatarListScrollPos;
-        private Vector2 _scrollPos;
+        protected VRC_AvatarDescriptor[] _avatars;
+        protected static VRC_AvatarDescriptor _selectedAvatar;
+        private static VRCSdkControlPanelAvatarBuilder _instance;
 
-
-        protected const int MAX_ACTION_TEXTURE_SIZE = 256;
-
-        private bool showAvatarPerformanceDetails
+        private static bool ShowAvatarPerformanceDetails
         {
             get => EditorPrefs.GetBool("VRC.SDKBase_showAvatarPerformanceDetails", false);
             set => EditorPrefs.SetBool("VRC.SDKBase_showAvatarPerformanceDetails",
-                value); //Do we ever actually set this?
+                value);
         }
 
         private static PropertyInfo _legacyBlendShapeNormalsPropertyInfo;
@@ -51,134 +78,84 @@ namespace VRC.SDKBase.Editor
             }
         }
 
+        #region Main Interface Methods
         public void ShowSettingsOptions()
         {
             EditorGUILayout.BeginVertical(VRCSdkControlPanel.boxGuiStyle);
             GUILayout.Label("Avatar Options", EditorStyles.boldLabel);
-            bool prevShowPerfDetails = showAvatarPerformanceDetails;
+            bool prevShowPerfDetails = ShowAvatarPerformanceDetails;
             bool showPerfDetails =
                 EditorGUILayout.ToggleLeft("Show All Avatar Performance Details", prevShowPerfDetails);
             if (showPerfDetails != prevShowPerfDetails)
             {
-                showAvatarPerformanceDetails = showPerfDetails;
+                ShowAvatarPerformanceDetails = showPerfDetails;
                 _builder.ResetIssues();
             }
 
             EditorGUILayout.EndVertical();
         }
 
-        public bool IsValidBuilder(out string message)
+        public virtual bool IsValidBuilder(out string message)
         {
+            if (UnityEditor.EditorPrefs.GetBool("VRC.SDK3.EnableV3", false))
+            {
+                message = "Multiple pipelines are present. V3 pipeline will take priority";
+                return false;
+            }
             FindAvatars();
             message = null;
             if (_avatars != null && _avatars.Length > 0) return true;
-#if VRC_SDK_VRCSDK2
-            message = "A VRC_SceneDescriptor or VRC_AvatarDescriptor\nis required to build VRChat SDK Content";
-#elif VRC_SDK_VRCSDK3
             message = "A VRCSceneDescriptor or VRCAvatarDescriptor\nis required to build VRChat SDK Content";
-#endif
             return false;
         }
-
-        public virtual void ShowBuilder()
+        
+        protected void FindAvatars()
         {
-            if (_avatars.Length > 0)
+            List<VRC_AvatarDescriptor> allAvatars = Tools.FindSceneObjectsOfTypeAll<VRC_AvatarDescriptor>().ToList();
+            // Select only the active avatars
+            VRC_AvatarDescriptor[] newAvatars =
+                allAvatars.Where(av => null != av && av.gameObject.activeInHierarchy).ToArray();
+
+            if (_avatars != null)
             {
-                if (!_builder.CheckedForIssues)
-                {
-                    _builder.ResetIssues();
-                    foreach (VRC_AvatarDescriptor t in _avatars)
-                        OnGUIAvatarCheck(t);
-                    _builder.CheckedForIssues = true;
-                }
+                foreach (VRC_AvatarDescriptor a in newAvatars)
+                    if (_avatars.Contains(a) == false)
+                        _builder.CheckedForIssues = false;
+            }
 
-                bool drawList = true;
-                if (_avatars.Length == 1)
-                {
-                    drawList = false;
-                    _selectedAvatar = _avatars[0];
-                }
+            _avatars = newAvatars.Reverse().ToArray();
+        }
 
-                if (drawList)
-                {
-                    EditorGUILayout.BeginVertical(GUI.skin.GetStyle("HelpBox"),
-                                                  GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth),
-                                                  GUILayout.MaxHeight(150));
-                    _avatarListScrollPos = EditorGUILayout.BeginScrollView(_avatarListScrollPos, false, false);
+        public void ShowBuilder()
+        {
+            if (_instance == null)
+            {
+                _instance = this;
+            }
+            if (BuildPipeline.isBuildingPlayer)
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Building – Please Wait ...",
+                    VRCSdkControlPanel.titleGuiStyle,
+                    GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
+                return;
+            }
+            
+            if (!_builder.CheckedForIssues)
+            {
+                _builder.ResetIssues();
+                foreach (VRC_AvatarDescriptor t in _avatars)
+                    OnGUIAvatarCheck(t);
+                _builder.CheckedForIssues = true;
+            }
 
-                    for (int i = 0; i < _avatars.Length; ++i)
-                    {
-                        VRC_AvatarDescriptor av = _avatars[i];
-                        EditorGUILayout.Space();
-                        if (_selectedAvatar == av)
-                        {
-                            if (GUILayout.Button(av.gameObject.name,
-                                                 VRCSdkControlPanel.listButtonStyleSelected,
-                                                 GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth - 50)))
-                                _selectedAvatar = null;
-                        }
-                        else
-                        {
-                            if (GUILayout.Button(av.gameObject.name,
-                                        ((i & 0x01) > 0)
-                                        ? (VRCSdkControlPanel.listButtonStyleOdd)
-                                        : (VRCSdkControlPanel.listButtonStyleEven),
-                                        GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth - 50)))
-                                _selectedAvatar = av;
-                        }
-                    }
-
-                    EditorGUILayout.EndScrollView();
-                    EditorGUILayout.EndVertical();
-                }
-
-                EditorGUILayout.BeginVertical(GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
+            using (new EditorGUILayout.VerticalScope())
+            {
                 _builder.OnGUIShowIssues();
-                EditorGUILayout.EndVertical();
-
-                EditorGUILayout.Separator();
 
                 if (_selectedAvatar != null)
                 {
-                    EditorGUILayout.BeginVertical(VRCSdkControlPanel.boxGuiStyle);
-                    OnGUIAvatarSettings(_selectedAvatar);
-                    EditorGUILayout.EndVertical();
-
-                    _scrollPos = EditorGUILayout.BeginScrollView(_scrollPos,
-                                                                 false,
-                                                                 false,
-                                                                 GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
                     _builder.OnGUIShowIssues(_selectedAvatar);
-                    EditorGUILayout.EndScrollView();
-
-                    GUILayout.FlexibleSpace();
-
-                    OnGUIAvatar(_selectedAvatar);
-                }
-            }
-            else
-            {
-                EditorGUILayout.Space();
-                if (UnityEditor.BuildPipeline.isBuildingPlayer)
-                {
-                    EditorGUILayout.Space();
-                    EditorGUILayout.LabelField("Building – Please Wait ...",
-                                               VRCSdkControlPanel.titleGuiStyle,
-                                               GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
-                }
-                else
-                {
-#if VRC_SDK_VRCSDK2
-                    EditorGUILayout.LabelField(
-                            "A VRC_SceneDescriptor or VRC_AvatarDescriptor\nis required to build VRChat SDK Content",
-                            VRCSdkControlPanel.titleGuiStyle, GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
-#elif VRC_SDK_VRCSDK3
-                    EditorGUILayout.LabelField(
-                            "A VRCSceneDescriptor or VRCAvatarDescriptor\nis required to build VRChat SDK Content",
-                            VRCSdkControlPanel.titleGuiStyle, GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
-#else
-                    EditorGUILayout.LabelField("A SceneDescriptor or AvatarDescriptor\nis required to build VRChat SDK Content", VRCSdkControlPanel.titleGuiStyle, GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
-#endif
                 }
             }
         }
@@ -195,37 +172,34 @@ namespace VRC.SDKBase.Editor
                 show.Add(a.gameObject);
             Selection.objects = show.ToArray();
         }
+        
+        #endregion
 
-        private void FindAvatars()
+        public static void SelectAvatar(VRC_AvatarDescriptor avatar)
         {
-            List<VRC_AvatarDescriptor> allAvatars = Tools.FindSceneObjectsOfTypeAll<VRC_AvatarDescriptor>().ToList();
-            // Select only the active avatars
-            VRC_AvatarDescriptor[] newAvatars =
-                allAvatars.Where(av => null != av && av.gameObject.activeInHierarchy).ToArray();
-
-            if (_avatars != null)
-            {
-                foreach (VRC_AvatarDescriptor a in newAvatars)
-                    if (_avatars.Contains(a) == false)
-                        _builder.CheckedForIssues = false;
-            }
-
-            _avatars = newAvatars;
+            if (_instance == null) return;
+            _selectedAvatar = avatar;
+            _instance._avatarSelector.SetAvatarSelection(avatar);
+            _instance.HandleAvatarSwitch(_instance._visualRoot);
         }
 
-        public virtual void OnGUIAvatarCheck(VRC_AvatarDescriptor avatar)
+        #region Avatar Validations (IMGUI)
+        
+        private void OnGUIAvatarCheck(VRC_AvatarDescriptor avatar)
         {
+            if (avatar == null) return;
             string vrcFilePath = UnityWebRequest.UnEscapeURL(EditorPrefs.GetString("currentBuildingAssetBundlePath"));
+            bool isMobilePlatform = ValidationEditorHelpers.IsMobilePlatform();
             if (!string.IsNullOrEmpty(vrcFilePath) &&
-                ValidationHelpers.CheckIfAssetBundleFileTooLarge(ContentType.Avatar, vrcFilePath, out int fileSize))
+                ValidationHelpers.CheckIfAssetBundleFileTooLarge(ContentType.Avatar, vrcFilePath, out int fileSize, isMobilePlatform))
             {
                 _builder.OnGUIWarning(avatar,
-                    ValidationHelpers.GetAssetBundleOverSizeLimitMessageSDKWarning(ContentType.Avatar, fileSize),
+                    ValidationHelpers.GetAssetBundleOverSizeLimitMessageSDKWarning(ContentType.Avatar, fileSize, isMobilePlatform),
                     delegate { Selection.activeObject = avatar.gameObject; }, null);
             }
 
-            AvatarPerformanceStats perfStats = new AvatarPerformanceStats();
-            AvatarPerformance.CalculatePerformanceStats(avatar.Name, avatar.gameObject, perfStats);
+            AvatarPerformanceStats perfStats = new AvatarPerformanceStats(ValidationEditorHelpers.IsMobilePlatform());
+            AvatarPerformance.CalculatePerformanceStats(avatar.Name, avatar.gameObject, perfStats, isMobilePlatform);
 
             OnGUIPerformanceInfo(avatar, perfStats, AvatarPerformanceCategory.Overall,
                 GetAvatarSubSelectAction(avatar, typeof(VRC_AvatarDescriptor)), null);
@@ -239,18 +213,16 @@ namespace VRC.SDKBase.Editor
                 _builder.OnGUIError(avatar, "This avatar uses Visemes but the Face Mesh is not specified.",
                     delegate { Selection.activeObject = avatar.gameObject; }, null);
 
-            if (ShaderKeywordsUtility.DetectCustomShaderKeywords(avatar))
-                _builder.OnGUIWarning(avatar,
-                    "A Material on this avatar has custom shader keywords. Please consider optimizing it using the Shader Keywords Utility.",
-                    () => { Selection.activeObject = avatar.gameObject; },
-                    () =>
-                    {
-                        EditorApplication.ExecuteMenuItem("VRChat SDK/Utilities/Avatar Shader Keywords Utility");
-                    });
-
             VerifyAvatarMipMapStreaming(avatar);
+            VerifyMaxTextureSize(avatar);
 
-            Animator anim = avatar.GetComponent<Animator>();
+            if (!avatar.TryGetComponent<Animator>(out var anim))
+            {
+                _builder.OnGUIError(avatar,
+                    "This avatar does not contain an Animator, you need to add an Animator component for the avatar to work",
+                    delegate { Selection.activeObject = avatar.gameObject; }, null);
+                return;
+            }
             if (anim == null)
             {
                 _builder.OnGUIWarning(avatar,
@@ -312,31 +284,36 @@ namespace VRC.SDKBase.Editor
 
                 if (AnalyzeIK(avatar, anim) == false)
                     _builder.OnGUILink(avatar, "See Avatar Rig Requirements for more information.",
-                        VRCSdkControlPanel.AVATAR_RIG_REQUIREMENTS_URL);
+                        VRCSdkControlPanelHelp.AVATAR_RIG_REQUIREMENTS_URL);
             }
 
             ValidateFeatures(avatar, anim, perfStats);
 
-            Core.PipelineManager pm = avatar.GetComponent<Core.PipelineManager>();
+            PipelineManager pm = avatar.GetComponent<PipelineManager>();
 
             PerformanceRating rating = perfStats.GetPerformanceRatingForCategory(AvatarPerformanceCategory.Overall);
             if (_builder.NoGuiErrors())
             {
-                if (rating > PerformanceRating.Good)
+                if (!anim.isHuman)
                 {
-                    if (pm != null) pm.fallbackStatus = Core.PipelineManager.FallbackStatus.InvalidPerformance;
+                    if (pm != null) pm.fallbackStatus = PipelineManager.FallbackStatus.InvalidRig;
+                    _builder.OnGUIInformation(avatar, "This avatar does not have a humanoid rig, so it can not be used as a custom fallback.");
+                }
+                else if (rating > PerformanceRating.Good)
+                {
+                    if (pm != null) pm.fallbackStatus = PipelineManager.FallbackStatus.InvalidPerformance;
                     _builder.OnGUIInformation(avatar, "This avatar does not have an overall rating of Good or better, so it can not be used as a custom fallback. See the link below for details on Avatar Optimization.");
                 }
                 else
                 {
-                    if (pm != null) pm.fallbackStatus = Core.PipelineManager.FallbackStatus.Valid;
+                    if (pm != null) pm.fallbackStatus = PipelineManager.FallbackStatus.Valid;
                     _builder.OnGUIInformation(avatar, "This avatar can be used as a custom fallback. This avatar must be uploaded for every supported platform to be valid for fallback selection.");
                     if (perfStats.animatorCount.HasValue && perfStats.animatorCount.Value > 1)
                         _builder.OnGUIInformation(avatar, "This avatar uses additional animators, they will be disabled when used as a fallback.");
                 }
 
                 // additional messages for Poor and Very Poor Avatars
-#if UNITY_ANDROID
+#if UNITY_ANDROID || UNITY_IOS
                 if (rating > PerformanceRating.Poor)
                     _builder.OnGUIInformation(avatar, "This avatar will be blocked by default due to performance. Your fallback will be shown instead.");
                 else if (rating > PerformanceRating.Medium)
@@ -349,16 +326,489 @@ namespace VRC.SDKBase.Editor
             else
             {
                 // shouldn't matter because we can't hit upload button
-                if (pm != null) pm.fallbackStatus = Core.PipelineManager.FallbackStatus.InvalidPlatform;
+                if (pm != null) pm.fallbackStatus = PipelineManager.FallbackStatus.InvalidPlatform;
             }
         }
 
-        public virtual void ValidateFeatures(VRC_AvatarDescriptor avatar, Animator anim, AvatarPerformanceStats perfStats)
+        private void GenerateDebugHashset(VRCAvatarDescriptor avatar)
         {
-            // stub, used in SDK3A for Expression Menu, etc.
+            avatar.animationHashSet.Clear();
+
+            foreach (VRCAvatarDescriptor.CustomAnimLayer animLayer in avatar.baseAnimationLayers)
+            {
+                AnimatorController controller = animLayer.animatorController as AnimatorController;
+                if (controller != null)
+                {
+                    foreach (AnimatorControllerLayer layer in controller.layers)
+                    {
+                        ProcessStateMachine(layer.stateMachine, "");
+                        void ProcessStateMachine(AnimatorStateMachine stateMachine, string prefix)
+                        {
+                            //Update prefix
+                            prefix = prefix + stateMachine.name + ".";
+
+                            //States
+                            foreach (var state in stateMachine.states)
+                            {
+                                VRCAvatarDescriptor.DebugHash hash = new VRCAvatarDescriptor.DebugHash();
+                                string fullName = prefix + state.state.name;
+                                hash.hash = Animator.StringToHash(fullName);
+                                hash.name = fullName.Remove(0, layer.stateMachine.name.Length + 1);
+                                avatar.animationHashSet.Add(hash);
+                            }
+
+                            //Sub State Machines
+                            foreach (var subMachine in stateMachine.stateMachines)
+                                ProcessStateMachine(subMachine.stateMachine, prefix);
+                        }
+                    }
+                }
+            }
         }
 
-        protected void OnGUIPerformanceInfo(VRC_AvatarDescriptor avatar, AvatarPerformanceStats perfStats,
+        private void ValidateFeatures(VRC_AvatarDescriptor avatar, Animator anim, AvatarPerformanceStats perfStats)
+        {
+            //Create avatar debug hashset
+            VRCAvatarDescriptor avatarSDK3 = avatar as VRCAvatarDescriptor;
+            if (avatarSDK3 != null)
+            {
+                GenerateDebugHashset(avatarSDK3);
+            }
+
+            //Validate Playable Layers
+            if (avatarSDK3 != null && avatarSDK3.customizeAnimationLayers)
+            {
+                VRCAvatarDescriptor.CustomAnimLayer gestureLayer = avatarSDK3.baseAnimationLayers[2];
+                if (anim != null
+                    && anim.isHuman
+                    && gestureLayer.animatorController != null
+                    && gestureLayer.type == VRCAvatarDescriptor.AnimLayerType.Gesture
+                    && !gestureLayer.isDefault)
+                {
+                    AnimatorController controller = gestureLayer.animatorController as AnimatorController;
+                    if (controller != null && controller.layers[0].avatarMask == null)
+                        _builder.OnGUIError(avatar, "Gesture Layer needs valid mask on first animator layer",
+                            delegate { OpenAnimatorControllerWindow(controller); }, null);
+                }
+            }
+
+            //Expression menu images
+            if (avatarSDK3 != null)
+            {
+                bool ValidateTexture(Texture2D texture)
+                {
+                    string path = AssetDatabase.GetAssetPath(texture);
+                    TextureImporter importer = AssetImporter.GetAtPath(path) as TextureImporter;
+                    if (importer == null)
+                        return true;
+                    TextureImporterPlatformSettings settings = importer.GetDefaultPlatformTextureSettings();
+
+                    //Max texture size
+                    if ((texture.width > MAX_ACTION_TEXTURE_SIZE || texture.height > MAX_ACTION_TEXTURE_SIZE) &&
+                        settings.maxTextureSize > MAX_ACTION_TEXTURE_SIZE)
+                        return false;
+
+                    //Compression
+                    if (settings.textureCompression == TextureImporterCompression.Uncompressed)
+                        return false;
+
+                    //Success
+                    return true;
+                }
+
+                void FixTexture(Texture2D texture)
+                {
+                    string path = AssetDatabase.GetAssetPath(texture);
+                    TextureImporter importer = AssetImporter.GetAtPath(path) as TextureImporter;
+                    if (importer == null)
+                        return;
+                    TextureImporterPlatformSettings settings = importer.GetDefaultPlatformTextureSettings();
+
+                    //Max texture size
+                    if (texture.width > MAX_ACTION_TEXTURE_SIZE || texture.height > MAX_ACTION_TEXTURE_SIZE)
+                        settings.maxTextureSize = Math.Min(settings.maxTextureSize, MAX_ACTION_TEXTURE_SIZE);
+
+                    //Compression
+                    if (settings.textureCompression == TextureImporterCompression.Uncompressed)
+                        settings.textureCompression = TextureImporterCompression.Compressed;
+
+                    //Set & Reimport
+                    importer.SetPlatformTextureSettings(settings);
+                    AssetDatabase.ImportAsset(path);
+                }
+
+                //Find all textures
+                List<Texture2D> textures = new List<Texture2D>();
+                List<VRCExpressionsMenu> menuStack = new List<VRCExpressionsMenu>();
+                FindTextures(avatarSDK3.expressionsMenu);
+
+                void FindTextures(VRCExpressionsMenu menu)
+                {
+                    if (menu == null || menuStack.Contains(menu)) //Prevent recursive menu searching
+                        return;
+                    menuStack.Add(menu);
+
+                    //Check controls
+                    foreach (VRCExpressionsMenu.Control control in menu.controls)
+                    {
+                        AddTexture(control.icon);
+                        if (control.labels != null)
+                        {
+                            foreach (VRCExpressionsMenu.Control.Label label in control.labels)
+                                AddTexture(label.icon);
+                        }
+
+                        if (control.subMenu != null)
+                            FindTextures(control.subMenu);
+                    }
+
+                    void AddTexture(Texture2D texture)
+                    {
+                        if (texture != null)
+                            textures.Add(texture);
+                    }
+                }
+
+                //Validate
+                bool isValid = true;
+                foreach (Texture2D texture in textures)
+                {
+                    if (!ValidateTexture(texture))
+                        isValid = false;
+                }
+
+                if (!isValid)
+                    _builder.OnGUIError(avatar, "Images used for Actions & Moods are too large.",
+                        delegate { Selection.activeObject = avatar.gameObject; }, FixTextures);
+
+                //Fix
+                void FixTextures()
+                {
+                    foreach (Texture2D texture in textures)
+                        FixTexture(texture);
+                }
+            }
+
+            //Expression menu parameters
+            if (avatarSDK3 != null)
+            {
+                //Check for expression menu/parameters object
+                if (avatarSDK3.expressionsMenu != null || avatarSDK3.expressionParameters != null)
+                {
+                    //Menu
+                    if (avatarSDK3.expressionsMenu == null)
+                        _builder.OnGUIError(avatar, "VRCExpressionsMenu object reference is missing.",
+                            delegate { Selection.activeObject = avatarSDK3; }, null);
+
+                    //Parameters
+                    if (avatarSDK3.expressionParameters == null)
+                        _builder.OnGUIError(avatar, "VRCExpressionParameters object reference is missing.",
+                            delegate { Selection.activeObject = avatarSDK3; }, null);
+                }
+
+                //Check if parameters is valid
+                if (avatarSDK3.expressionParameters != null && avatarSDK3.expressionParameters.CalcTotalCost() > VRCExpressionParameters.MAX_PARAMETER_COST)
+                {
+                    _builder.OnGUIError(avatar, "VRCExpressionParameters has too many parameters defined.",
+                        delegate { Selection.activeObject = avatarSDK3.expressionParameters; }, null);
+                }
+
+                //Find all existing parameters
+                if (avatarSDK3.expressionsMenu != null && avatarSDK3.expressionParameters != null)
+                {
+                    List<VRCExpressionsMenu> menuStack = new List<VRCExpressionsMenu>();
+                    List<string> parameters = new List<string>();
+                    List<VRCExpressionsMenu> selects = new List<VRCExpressionsMenu>();
+                    FindParameters(avatarSDK3.expressionsMenu);
+
+                    void FindParameters(VRCExpressionsMenu menu)
+                    {
+                        if (menu == null || menuStack.Contains(menu)) //Prevent recursive menu searching
+                            return;
+                        menuStack.Add(menu);
+
+                        //Check controls
+                        foreach (VRCExpressionsMenu.Control control in menu.controls)
+                        {
+                            AddParameter(control.parameter);
+                            if (control.subParameters != null)
+                            {
+                                foreach (VRCExpressionsMenu.Control.Parameter subParameter in control.subParameters)
+                                {
+                                    AddParameter(subParameter);
+                                }
+                            }
+
+                            if (control.subMenu != null)
+                                FindParameters(control.subMenu);
+                        }
+
+                        void AddParameter(VRCExpressionsMenu.Control.Parameter parameter)
+                        {
+                            if (parameter != null)
+                            {
+                                parameters.Add(parameter.name);
+                                selects.Add(menu);
+                            }
+                        }
+                    }
+
+                    //Validate parameters
+                    for (int i = 0; i < parameters.Count; i++)
+                    {
+                        string parameter = parameters[i];
+                        VRCExpressionsMenu select = selects[i];
+
+                        //Find
+                        bool exists = string.IsNullOrEmpty(parameter) || avatarSDK3.expressionParameters.FindParameter(parameter) != null;
+                        if (!exists)
+                        {
+                            _builder.OnGUIError(avatar,
+                                "VRCExpressionsMenu uses a parameter that is not defined.\nParameter: " + parameter,
+                                delegate { Selection.activeObject = select; }, null);
+                        }
+                    }
+
+                    //Validate param choices
+                    foreach (var menu in menuStack)
+                    {
+                        foreach (var control in menu.controls)
+                        {
+                            bool isValid = true;
+                            if (control.type == VRCExpressionsMenu.Control.ControlType.FourAxisPuppet)
+                            {
+                                isValid &= ValidateNonBoolParam(control.subParameters[0].name);
+                                isValid &= ValidateNonBoolParam(control.subParameters[1].name);
+                                isValid &= ValidateNonBoolParam(control.subParameters[2].name);
+                                isValid &= ValidateNonBoolParam(control.subParameters[3].name);
+                            }
+                            else if (control.type == VRCExpressionsMenu.Control.ControlType.RadialPuppet)
+                            {
+                                isValid &= ValidateNonBoolParam(control.subParameters[0].name);
+                            }
+                            else if (control.type == VRCExpressionsMenu.Control.ControlType.TwoAxisPuppet)
+                            {
+                                isValid &= ValidateNonBoolParam(control.subParameters[0].name);
+                                isValid &= ValidateNonBoolParam(control.subParameters[1].name);
+                            }
+                            if (!isValid)
+                            {
+                                _builder.OnGUIError(avatar,
+                                "VRCExpressionsMenu uses an invalid parameter for a control.\nControl: " + control.name,
+                                delegate { Selection.activeObject = menu; }, null);
+                            }
+                        }
+
+                        bool ValidateNonBoolParam(string name)
+                        {
+                            VRCExpressionParameters.Parameter param = string.IsNullOrEmpty(name) ? null : avatarSDK3.expressionParameters.FindParameter(name);
+                            if (param != null && param.valueType == VRCExpressionParameters.ValueType.Bool)
+                                return false;
+                            return true;
+                        }
+                    }
+                }
+
+                //Dynamic Bones
+                if (perfStats.dynamicBone != null && (perfStats.dynamicBone.Value.colliderCount > 0 || perfStats.dynamicBone.Value.componentCount > 0))
+                {
+                    _builder.OnGUIWarning(avatar, "This avatar uses depreciated DynamicBone components. Upgrade to PhysBones to guarantee future compatibility.",
+                        null,
+                        () => { AvatarDynamicsSetup.ConvertDynamicBonesToPhysBones( new GameObject[]{ avatarSDK3.gameObject} ); });
+                }
+            }
+
+            List<Component> componentsToRemove = SDK3.Validation.AvatarValidation.FindIllegalComponents(avatar.gameObject).ToList();
+
+            // create a list of the PipelineSaver component(s)
+            List<Component> toRemoveSilently = new List<Component>();
+            foreach (Component c in componentsToRemove)
+            {
+                if (c.GetType().Name == "PipelineSaver")
+                {
+                    toRemoveSilently.Add(c);
+                }
+            }
+
+            // delete PipelineSaver(s) from the list of the Components we will destroy now
+            foreach (Component c in toRemoveSilently)
+            {
+                    componentsToRemove.Remove(c);
+            }
+
+            HashSet<string> componentsToRemoveNames = new HashSet<string>();
+            List<Component> toRemove = componentsToRemove ?? componentsToRemove;
+            foreach (Component c in toRemove)
+            {
+                if (componentsToRemoveNames.Contains(c.GetType().Name) == false)
+                    componentsToRemoveNames.Add(c.GetType().Name);
+            }
+
+            if (componentsToRemoveNames.Count > 0)
+                _builder.OnGUIError(avatar,
+                    "The following component types are found on the Avatar and will be removed by the client: " +
+                    string.Join(", ", componentsToRemoveNames.ToArray()),
+                    delegate { ShowRestrictedComponents(toRemove); },
+                    delegate { FixRestrictedComponents(toRemove); });
+
+            List<AudioSource> audioSources =
+                avatar.gameObject.GetComponentsInChildrenExcludingEditorOnly<AudioSource>(true).ToList();
+            if (audioSources.Count > 0)
+                _builder.OnGUIWarning(avatar,
+                    "Audio sources found on Avatar, they will be adjusted to safe limits, if necessary.",
+                    GetAvatarSubSelectAction(avatar, typeof(AudioSource)), null);
+
+            foreach (var audioSource in audioSources)
+            {
+                if (audioSource.clip && audioSource.clip.loadType == AudioClipLoadType.DecompressOnLoad && !audioSource.clip.loadInBackground)
+                    _builder.OnGUIError(avatar,
+                        "Found an audio clip with load type `Decompress On Load` which doesn't have `Load In Background` enabled.\nPlease enable `Load In Background` on the audio clip.", 
+                         GetAvatarAudioSourcesWithDecompressOnLoadWithoutBackgroundLoad(avatar), null);
+            }
+            
+            List<VRCStation> stations =
+                avatar.gameObject.GetComponentsInChildrenExcludingEditorOnly<VRCStation>(true).ToList();
+            if (stations.Count > 0)
+                _builder.OnGUIWarning(avatar, "Stations found on Avatar, they will be adjusted to safe limits, if necessary.",
+                    GetAvatarSubSelectAction(avatar, typeof(VRCStation)), null);
+
+            if (VRCSdkControlPanel.HasSubstances(avatar.gameObject))
+            {
+                _builder.OnGUIWarning(avatar,
+                    "This avatar has one or more Substance materials, which is not supported and may break in-game. Please bake your Substances to regular materials.",
+                    () => { Selection.objects = VRCSdkControlPanel.GetSubstanceObjects(avatar.gameObject); },
+                    null);
+            }
+
+            CheckAvatarMeshesForLegacyBlendShapesSetting(avatar);
+            CheckAvatarMeshesForMeshReadWriteSetting(avatar);
+
+#if UNITY_ANDROID
+            IEnumerable<Shader> illegalShaders = VRC.SDK3.Validation.AvatarValidation.FindIllegalShaders(avatar.gameObject);
+            foreach (Shader s in illegalShaders)
+            {
+                _builder.OnGUIError(avatar, "Avatar uses unsupported shader '" + s.name + "'. You can only use the shaders provided in 'VRChat/Mobile' for Quest avatars.", delegate () { Selection.activeObject
+     = avatar.gameObject; }, null);
+            }
+#endif
+
+            foreach (AvatarPerformanceCategory perfCategory in Enum.GetValues(typeof(AvatarPerformanceCategory)))
+            {
+                if (perfCategory == AvatarPerformanceCategory.Overall ||
+                    perfCategory == AvatarPerformanceCategory.PolyCount ||
+                    perfCategory == AvatarPerformanceCategory.AABB ||
+                    perfCategory == AvatarPerformanceCategory.AvatarPerformanceCategoryCount)
+                {
+                    continue;
+                }
+
+                Action show = null;
+
+                switch (perfCategory)
+                {
+                    case AvatarPerformanceCategory.AnimatorCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Animator));
+                        break;
+                    case AvatarPerformanceCategory.AudioSourceCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(AudioSource));
+                        break;
+                    case AvatarPerformanceCategory.BoneCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(SkinnedMeshRenderer));
+                        break;
+                    case AvatarPerformanceCategory.ClothCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Cloth));
+                        break;
+                    case AvatarPerformanceCategory.ClothMaxVertices:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Cloth));
+                        break;
+                    case AvatarPerformanceCategory.LightCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Light));
+                        break;
+                    case AvatarPerformanceCategory.LineRendererCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(LineRenderer));
+                        break;
+                    case AvatarPerformanceCategory.MaterialCount:
+                        show = GetAvatarSubSelectAction(avatar,
+                            new[] {typeof(MeshRenderer), typeof(SkinnedMeshRenderer)});
+                        break;
+                    case AvatarPerformanceCategory.MeshCount:
+                        show = GetAvatarSubSelectAction(avatar,
+                            new[] {typeof(MeshRenderer), typeof(SkinnedMeshRenderer)});
+                        break;
+                    case AvatarPerformanceCategory.ParticleCollisionEnabled:
+                        show = GetAvatarSubSelectAction(avatar, typeof(ParticleSystem));
+                        break;
+                    case AvatarPerformanceCategory.ParticleMaxMeshPolyCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(ParticleSystem));
+                        break;
+                    case AvatarPerformanceCategory.ParticleSystemCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(ParticleSystem));
+                        break;
+                    case AvatarPerformanceCategory.ParticleTotalCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(ParticleSystem));
+                        break;
+                    case AvatarPerformanceCategory.ParticleTrailsEnabled:
+                        show = GetAvatarSubSelectAction(avatar, typeof(ParticleSystem));
+                        break;
+                    case AvatarPerformanceCategory.PhysicsColliderCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Collider));
+                        break;
+                    case AvatarPerformanceCategory.PhysicsRigidbodyCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(Rigidbody));
+                        break;
+                    case AvatarPerformanceCategory.PolyCount:
+                        show = GetAvatarSubSelectAction(avatar,
+                            new[] {typeof(MeshRenderer), typeof(SkinnedMeshRenderer)});
+                        break;
+                    case AvatarPerformanceCategory.SkinnedMeshCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(SkinnedMeshRenderer));
+                        break;
+                    case AvatarPerformanceCategory.TrailRendererCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(TrailRenderer));
+                        break;
+                    case AvatarPerformanceCategory.PhysBoneComponentCount:
+                    case AvatarPerformanceCategory.PhysBoneTransformCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBone));
+                        break;
+                    case AvatarPerformanceCategory.PhysBoneColliderCount:
+                    case AvatarPerformanceCategory.PhysBoneCollisionCheckCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(VRC.SDK3.Dynamics.PhysBone.Components.VRCPhysBoneCollider));
+                        break;
+                    case AvatarPerformanceCategory.ContactCount:
+                        show = GetAvatarSubSelectAction(avatar, typeof(VRC.Dynamics.ContactBase));
+                        break;
+                }
+
+                // we can only show these buttons if DynamicBone is installed
+
+                Type dynamicBoneType = typeof(VRC.SDK3.Validation.AvatarValidation).Assembly.GetType("DynamicBone");
+                Type dynamicBoneColliderType = typeof(VRC.SDK3.Validation.AvatarValidation).Assembly.GetType("DynamicBoneCollider");
+                if ((dynamicBoneType != null) && (dynamicBoneColliderType != null))
+                {
+                    switch (perfCategory)
+                    {
+                        case AvatarPerformanceCategory.DynamicBoneColliderCount:
+                            show = GetAvatarSubSelectAction(avatar, dynamicBoneColliderType);
+                            break;
+                        case AvatarPerformanceCategory.DynamicBoneCollisionCheckCount:
+                            show = GetAvatarSubSelectAction(avatar, dynamicBoneColliderType);
+                            break;
+                        case AvatarPerformanceCategory.DynamicBoneComponentCount:
+                            show = GetAvatarSubSelectAction(avatar, dynamicBoneType);
+                            break;
+                        case AvatarPerformanceCategory.DynamicBoneSimulatedBoneCount:
+                            show = GetAvatarSubSelectAction(avatar, dynamicBoneType);
+                            break;
+                    }
+                }
+
+                OnGUIPerformanceInfo(avatar, perfStats, perfCategory, show, null);
+            }
+
+            _builder.OnGUILink(avatar, "Avatar Optimization Tips", VRCSdkControlPanelHelp.AVATAR_OPTIMIZATION_TIPS_URL);
+        }
+
+        private void OnGUIPerformanceInfo(VRC_AvatarDescriptor avatar, AvatarPerformanceStats perfStats,
             AvatarPerformanceCategory perfCategory, Action show, Action fix)
         {
             PerformanceRating rating = perfStats.GetPerformanceRatingForCategory(perfCategory);
@@ -373,7 +823,7 @@ namespace VRC.SDKBase.Editor
                 }
                 case PerformanceInfoDisplayLevel.Verbose:
                 {
-                    if (showAvatarPerformanceDetails)
+                    if (ShowAvatarPerformanceDetails)
                     {
                         _builder.OnGUIStat(avatar, text, rating, show, fix);
                     }
@@ -404,130 +854,1588 @@ namespace VRC.SDKBase.Editor
                 }
             }
         }
+        
+        #endregion
 
-        public virtual void OnGUIAvatar(VRC_AvatarDescriptor avatar)
+        #region Avatar Builder UI (UIToolkit)
+        
+        public void CreateBuilderErrorGUI(VisualElement root)
         {
-            EditorGUILayout.BeginVertical(VRCSdkControlPanel.boxGuiStyle);
-            EditorGUILayout.BeginHorizontal();
-
-            EditorGUILayout.BeginVertical(GUILayout.Width(300));
-            EditorGUILayout.Space();
-
-            GUILayout.Label("Online Publishing", VRCSdkControlPanel.infoGuiStyle);
-            GUILayout.Label(
-                "In order for other people to see your avatar in VRChat it must be built and published to our game servers.",
-                VRCSdkControlPanel.infoGuiStyle);
-
-            EditorGUILayout.EndVertical();
-
-            EditorGUILayout.BeginVertical(GUILayout.Width(200));
-            EditorGUILayout.Space();
-
-            GUI.enabled = _builder.NoGuiErrorsOrIssues() ||
-                          Core.APIUser.CurrentUser.developerType == Core.APIUser.DeveloperType.Internal;
-            if (GUILayout.Button(VRCSdkControlPanel.GetBuildAndPublishButtonString()))
+            var errorContainer = new VisualElement();
+            errorContainer.AddToClassList("builder-error-container");
+            root.Add(errorContainer);
+            var errorLabel = new Label("A VRCAvatarDescriptor is required to build a VRChat Avatar");
+            errorLabel.AddToClassList("mb-2");
+            errorLabel.AddToClassList("text-center");
+            errorLabel.AddToClassList("white-space-normal");
+            errorLabel.style.maxWidth = 450;
+            errorContainer.Add(errorLabel);
+            var addButton = new Button
             {
-                bool buildBlocked = !VRCBuildPipelineCallbacks.OnVRCSDKBuildRequested(VRCSDKRequestedBuildType.Avatar);
-                if (!buildBlocked)
+                text = "Add a VRCAvatarDescriptor",
+                tooltip = "Adds a VRCAvatarDescriptor to the selected GameObject"
+            };
+            addButton.clickable.clicked += () =>
+            {
+                Undo.AddComponent<VRCAvatarDescriptor>(Selection.activeGameObject);
+                _builder.ResetIssues();
+            };
+            errorContainer.Add(addButton);
+            
+            if (Selection.activeGameObject == null)
+            {
+                addButton.SetEnabled(false);
+            }
+
+            errorContainer.schedule.Execute(() =>
+            {
+                var hasSelection = Selection.activeGameObject != null;
+                addButton.SetEnabled(hasSelection);
+                errorLabel.text = "A VRCAvatarDescriptor is required to build a VRChat Avatar" + (hasSelection ? "" : ".\nSelect a GameObject to add a VRCAvatarDescriptor to it.");
+            }).Every(500);
+        }
+        
+        private VRCAvatar _avatarData;
+        private VRCAvatar _originalAvatarData;
+
+        private VisualElement _saveChangesBlock;
+        private VisualElement _visualRoot;
+
+        private string _newThumbnailImagePath;
+        
+        private VRCTextField _nameField;
+        private VRCTextField _descriptionField;
+        private Label _lastUpdatedLabel;
+        private Label _versionLabel;
+        private Button _saveChangesButton;
+        private Button _discardChangesButton;
+        private VisualElement _progressBlock;
+        private VisualElement _progressBar;
+        private Label _progressText;
+        private Foldout _infoFoldout;
+        private Thumbnail _thumbnail;
+        private ThumbnailFoldout _thumbnailFoldout;
+        private Button _buildAndTestButton;
+        private Button _buildAndUploadButton;
+        private VisualElement _newAvatarBlock;
+        private Checklist _creationChecklist;
+        private AvatarSelector _avatarSelector;
+        private VisualElement _uploadDisabledBlock;
+        private Label _uploadDisabledText;
+        private VisualElement _localTestDisabledBlock;
+        private Label _localTestDisabledText;
+        private VisualElement _fallbackInfo;
+        private Button _updateCancelButton;
+        private ContentWarningsField _contentWarningsField;
+        protected VisualElement _v3Block;
+        private VisualElement _platformSwitcher;
+        private VisualElement _visibilityPopupBlock;
+        private Toggle _acceptTermsToggle;
+        private PopupField<string> _visibilityPopup;
+        private Dictionary<string, Foldout> _foldouts = new Dictionary<string, Foldout>();
+
+        private string _lastBlueprintId;
+
+        private bool _isContentInfoDirty;
+        private bool IsContentInfoDirty
+        {
+            get => _isContentInfoDirty;
+            set
+            {
+                _isContentInfoDirty = value;
+                var isDirty = CheckDirty();
+                var alreadyDirty = !_saveChangesBlock.ClassListContains("d-none");
+                _saveChangesBlock.EnableInClassList("d-none", !isDirty);
+                if (isDirty && !alreadyDirty)
                 {
-                    if (Core.APIUser.CurrentUser.canPublishAvatars)
+                    _saveChangesBlock.experimental.animation.Start(new Vector2(_visualRoot.layout.width, 0), new Vector2(_visualRoot.layout.width, 30), 250, (element, vector2) =>
                     {
-                        EnvConfig.FogSettings originalFogSettings = EnvConfig.GetFogSettings();
-                        EnvConfig.SetFogSettings(
-                            new EnvConfig.FogSettings(EnvConfig.FogSettings.FogStrippingMode.Custom, true, true, true));
+                        element.style.height = vector2.y;
+                    });
+                }
+            }
+        }
 
-#if UNITY_ANDROID
-                        EditorPrefs.SetBool("VRC.SDKBase_StripAllShaders", true);
-#else
-                        EditorPrefs.SetBool("VRC.SDKBase_StripAllShaders", false);
-#endif
+        private static CancellationTokenSource _avatarSwitchCancellationToken = new CancellationTokenSource();
+        private struct ProgressBarStateData
+        {
+            public bool Visible { get; set; }
+            public string Text { get; set; }
+            public float Progress { get; set; }
+            
+            public static implicit operator ProgressBarStateData(bool visible)
+            {
+                return new ProgressBarStateData {Visible = visible};
+            }
+        }
 
-#if VRC_SDK_VRCSDK2
-                        VRC_SdkBuilder.shouldBuildUnityPackage = VRCSdkControlPanel.FutureProofPublishEnabled;
-                        VRC_SdkBuilder.ExportAndUploadAvatarBlueprint(avatar.gameObject);
-#endif
+        private ProgressBarStateData _progressBarState;
+        private ProgressBarStateData ProgressBarState
+        {
+            get => _progressBarState;
+            set
+            {
+                if (_progressBarState.Visible != value.Visible)
+                {
+                    _progressBlock.EnableInClassList("d-none", !value.Visible);
+                    if (value.Visible)
+                    {
+                        _progressBar.style.width = 0;
+                    }
+                }
 
-                        EnvConfig.SetFogSettings(originalFogSettings);
+                _progressText.text = value.Text;
+                if (Mathf.Abs(_progressBarState.Progress - value.Progress) > float.Epsilon)
+                {
+                    // execute on next frame to allow for layout to calculate
+                    _visualRoot.schedule.Execute(() =>
+                    {
+                        _progressBar.experimental.animation.Start(
+                            new StyleValues {width = _progressBar.layout.width, height = 28f}, 
+                            new StyleValues {width = _progressBlock.layout.width * value.Progress, height = 28f}, 
+                            500
+                        );
+                    }).StartingIn(50);
+                }
+                _progressBarState = value;
+            }
+        }
 
-                        // this seems to workaround a Unity bug that is clearing the formatting of two levels of Layout
-                        // when we call the upload functions
-                        return;
+        private bool UpdateCancelEnabled
+        {
+            get => !_updateCancelButton.ClassListContains("d-none");
+            set
+            {
+                bool wasEnabled = UpdateCancelEnabled;
+                if (wasEnabled != value) 
+                {
+                    _updateCancelButton.EnableInClassList("d-none", wasEnabled);
+                }
+            }
+        }
+
+        private bool _uiEnabled;
+        private bool UiEnabled
+        {
+            get => _uiEnabled;
+            set
+            {
+                _uiEnabled = value;
+                _infoFoldout.SetEnabled(value);
+                _saveChangesButton.SetEnabled(value);
+                _discardChangesButton.SetEnabled(value);
+                _buildAndTestButton?.SetEnabled(value);
+                _buildAndUploadButton?.SetEnabled(value);
+                _thumbnailFoldout.SetEnabled(value);
+                _avatarSelector.PopupEnabled = value;
+                _platformSwitcher.SetEnabled(value);
+                _acceptTermsToggle?.SetEnabled(value);
+            }
+        }
+
+        private bool _isNewAvatar;
+        private bool IsNewAvatar
+        {
+            get => _isNewAvatar;
+            set
+            {
+                _isNewAvatar = value;
+                _newAvatarBlock.EnableInClassList("d-none", !value);
+            }
+        }
+
+        private enum FallbackStatus
+        {
+            Incompatible,
+            Compatible,
+            Selectable,
+            Selected
+        }
+
+        private FallbackStatus _currentFallbackStatus;
+
+        private FallbackStatus CurrentFallbackStatus
+        {
+            get => _currentFallbackStatus;
+            set
+            {
+                _currentFallbackStatus = value;
+                switch (_currentFallbackStatus)
+                {
+                    case FallbackStatus.Incompatible:
+                        _fallbackInfo.Clear();
+                        var label = new Label(
+                            "This avatar cannot be used as a fallback. Check Validations below for more info");
+                        label.AddToClassList("white-space-normal");
+                        _fallbackInfo.Add(label);
+                        break;
+                    case FallbackStatus.Compatible:
+                        _fallbackInfo.Clear();
+                        label = new Label();
+                        if (Tools.Platform == "android")
+                        {
+                            label.text = "This avatar can be used as a fallback. Check Validations below for more info.";
+                        }
+                        else
+                        {
+                            label.text =
+                                "This avatar can be used as a fallback. Switch to the Android platform to select it.";
+                        }
+                        label.AddToClassList("white-space-normal");
+                        _fallbackInfo.Add(label);
+                        break;
+                    case FallbackStatus.Selectable:
+                    {
+                        async void SetAvatarFallback()
+                        {
+                            try
+                            {
+                                _avatarData = await VRCApi.SetAvatarAsFallback(_avatarData.ID, _avatarData);
+                                CurrentFallbackStatus = FallbackStatus.Selected;
+                            }
+                            catch (ApiErrorException apiError)
+                            {
+                                await _builder.ShowBuilderNotification("Failed to set fallback",
+                                    new AvatarFallbackSelectionErrorNotification(apiError.ErrorMessage),
+                                    "red");
+                            }
+                            catch (RequestFailedException requestError)
+                            {
+                                await _builder.ShowBuilderNotification("Failed to set fallback",
+                                    new AvatarFallbackSelectionErrorNotification(requestError.Message),
+                                    "red");
+                            }
+                        }
+                        _fallbackInfo.Clear();
+                        var button = new Button(SetAvatarFallback)
+                        {
+                            text = "Set this avatar as fallback"
+                        };
+                        button.AddToClassList("flex-grow-1");
+                        _fallbackInfo.Add(button);
+                        break;
+                    }
+                    case FallbackStatus.Selected:
+                        _fallbackInfo.Clear();
+                        label = new Label(
+                            "This avatar is currently set as your fallback");
+                        label.AddToClassList("white-space-normal");
+                        _fallbackInfo.Add(label);
+                        break;
+                }
+            }
+        }
+
+        public void CreateContentInfoGUI(VisualElement root)
+        {
+            root.Clear();
+            root.UnregisterCallback<DetachFromPanelEvent>(HandlePanelDetach);
+            EditorSceneManager.sceneClosed -= HandleSceneClosed;
+            VRCSdkControlPanel.OnSdkPanelDisable -= HandleSdkPanelDisable;
+            
+            var tree = Resources.Load<VisualTreeAsset>("VRCSdkAvatarBuilderContentInfo");
+            tree.CloneTree(root);
+            var styles = Resources.Load<StyleSheet>("VRCSdkAvatarBuilderContentInfoStyles");
+            if (!root.styleSheets.Contains(styles))
+            {
+                root.styleSheets.Add(styles);
+            }
+
+            root.RegisterCallback<DetachFromPanelEvent>(HandlePanelDetach);
+            EditorSceneManager.sceneClosed += HandleSceneClosed;
+            VRCSdkControlPanel.OnSdkPanelDisable += HandleSdkPanelDisable;
+            
+            _avatarSelector = root.Q<AvatarSelector>("avatar-selector");
+            _nameField = root.Q<VRCTextField>("content-name");
+            _descriptionField = root.Q<VRCTextField>("content-description");
+            _lastUpdatedLabel = root.Q<Label>("last-updated-label");
+            _versionLabel = root.Q<Label>("version-label");
+            _infoFoldout = root.Q<Foldout>("info-foldout");
+            _thumbnailFoldout = root.Q<ThumbnailFoldout>();
+            _thumbnail = _thumbnailFoldout.Thumbnail;
+            _saveChangesBlock = root.panel.visualTree.Q("save-changes-block");
+            _saveChangesButton = _saveChangesBlock.Q<Button>("save-changes-button");
+            _discardChangesButton = _saveChangesBlock.Q<Button>("discard-changes-button");
+            _newAvatarBlock = root.Q("new-avatar-block");
+            _creationChecklist = root.Q<Checklist>("new-avatar-checklist");
+            _fallbackInfo = root.Q<VisualElement>("fallback-avatar-info");
+            _contentWarningsField = root.Q<ContentWarningsField>("content-warnings");
+
+            _platformSwitcher = _builder.rootVisualElement.Q("platform-switcher");
+            _progressBlock = _builder.rootVisualElement.Q("progress-section");
+            _progressBar = _builder.rootVisualElement.Q("update-progress-bar");
+            _progressText = _builder.rootVisualElement.Q<Label>("update-progress-text");
+            _progressBarState = false;
+            _updateCancelButton = _builder.rootVisualElement.Q<Button>("update-cancel-button");
+
+            _visibilityPopupBlock = root.Q("visibility-block");
+            _visibilityPopup = new PopupField<string>(
+                "Visibility", 
+                new List<string> {"private", "public"},
+                "private",
+                selected => selected.Substring(0,1).ToUpper() + selected.Substring(1), 
+                item => item.Substring(0,1).ToUpper() + item.Substring(1)
+            );
+            _visibilityPopupBlock.Add(_visibilityPopup);
+
+            var foldouts = root.Query<Foldout>().ToList();
+            _foldouts.Clear();
+            foreach (var foldout in foldouts)
+            {
+                _foldouts[foldout.name] = foldout;
+                foldout.RegisterValueChangedCallback(HandleFoldoutToggle);
+                foldout.SetValueWithoutNotify(SessionState.GetBool($"{AvatarBuilderSessionState.SESSION_STATE_PREFIX}.Foldout.{foldout.name}", true));
+            }
+
+            var currentAvatars = _avatars.ToList();
+            
+            {
+                _avatarSelector.RegisterValueChangedCallback(evt =>
+                {
+                    _selectedAvatar = evt.newValue;
+                    HandleAvatarSwitch(root);
+                });
+
+                var selectedIndex = currentAvatars.IndexOf(_selectedAvatar);
+                if (selectedIndex < 0) selectedIndex = currentAvatars.Count - 1;
+                _avatarSelector.SetAvatars(currentAvatars, selectedIndex);
+            }
+            
+            // avatars can be added or removed at any time, so we need to check for changes periodically
+            root.schedule.Execute(() =>
+            {
+                // this handles a case where the avatars didn't exist when the builder was opened
+                if (_selectedAvatar == null && _avatars.Length > 0)
+                {
+                    // special case when the avatar gets removed during upload
+                    if (_uploadState == SdkUploadState.Uploading) return;
+                    
+                    _selectedAvatar = _avatars[_avatars.Length - 1];
+                    HandleAvatarSwitch(root);
+                }
+                
+                // ignore any changes while the UI is disabled
+                if (!UiEnabled) return;
+
+                // this handles addition and removal of new avatars
+                if (_avatars.SequenceEqual(currentAvatars)) return;
+                
+                currentAvatars = _avatars.ToList();
+                if (currentAvatars.Count == 0) return;
+                var selectedIndex = currentAvatars.IndexOf(_selectedAvatar);
+                // if the selected avatar was removed - redraw the whole panel with new data
+                if (selectedIndex == -1)
+                {
+                    selectedIndex = currentAvatars.Count - 1;
+                    _selectedAvatar = _avatars[selectedIndex];
+                    HandleAvatarSwitch(root);
+                }
+                // update the popup with the new list on any sequence change
+                _avatarSelector.SetAvatars(currentAvatars, selectedIndex);
+            }).Every(1000);
+
+            if (_selectedAvatar != null)
+            {
+                HandleAvatarSwitch(root);
+            }
+        }
+
+        private async void HandleAvatarSwitch(VisualElement root)
+        {
+            _visualRoot = root;
+            // Cancel all ongoing ops
+            _avatarSwitchCancellationToken.Cancel();
+            _avatarSwitchCancellationToken = new CancellationTokenSource();
+            
+            var platformsBlock = root.Q<Label>("content-platform-info");
+            
+            // Unregister all the callbacks to avoid multiple calls
+            _nameField.UnregisterCallback<ChangeEvent<string>>(HandleNameChange);
+            _descriptionField.UnregisterCallback<ChangeEvent<string>>(HandleDescriptionChange);
+            _visibilityPopup.UnregisterCallback<ChangeEvent<string>>(HandleVisibilityChange);
+            _thumbnailFoldout.OnNewThumbnailSelected -= HandleThumbnailChanged;
+            _discardChangesButton.clicked -= HandleDiscardChangesClick;
+            _saveChangesButton.clicked -= HandleSaveChangesClick;
+            _contentWarningsField.OnToggleTag -= HandleToggleTag;
+            root.schedule.Execute(CheckBlueprintChanges).Pause();
+
+            // Load the avatar data
+            _nameField.Loading = true;
+            _descriptionField.Loading = true;
+            _thumbnail.Loading = true;
+            _nameField.Reset();
+            _descriptionField.Reset();
+            _thumbnail.ClearImage();
+            IsNewAvatar = false;
+            _fallbackInfo.Clear();
+            _fallbackInfo.Add(new Label("Loading..."));
+            UiEnabled = false;
+
+            // we're in the middle of scene changes, so we exit early
+            if (_selectedAvatar == null) return;
+            
+            var hasPm = _selectedAvatar.TryGetComponent<PipelineManager>(out var pm);
+            if (!hasPm)
+            {
+                Debug.LogWarning("No PipelineManager found on the avatar, make sure you added an Avatar Descriptor");
+                return;
+            }
+
+            var avatarId = pm.blueprintId;
+            _lastBlueprintId = avatarId;
+            _avatarData = new VRCAvatar();
+            if (string.IsNullOrWhiteSpace(avatarId))
+            {
+                IsNewAvatar = true;
+            }
+            else
+            {
+                try
+                {
+                    _avatarData = await VRCApi.GetAvatar(avatarId, true, cancellationToken: _avatarSwitchCancellationToken.Token);
+                    if (APIUser.CurrentUser != null && _avatarData.AuthorId != APIUser.CurrentUser?.id)
+                    {
+                        Core.Logger.LogError("Loaded data for the avatar we do not own, clearing blueprint ID");
+                        Undo.RecordObject(pm, "Cleared the blueprint ID we do not own");
+                        pm.blueprintId = "";
+                        avatarId = "";
+                        _lastBlueprintId = "";
+                        _avatarData = new VRCAvatar();
+                        IsNewAvatar = true;
+                    }
+                }
+                catch (TaskCanceledException)
+                {
+                    // avatar selection changed
+                    return;
+                }
+                catch (ApiErrorException ex)
+                {
+                    if (ex.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        _avatarData = new VRCAvatar();
+                        IsNewAvatar = true;
                     }
                     else
                     {
-                        VRCSdkControlPanel.ShowContentPublishPermissionsDialog();
+                        Debug.LogError(ex.ErrorMessage);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogException(ex);
+                }
+            }
+
+            if (IsNewAvatar)
+            {
+                RestoreSessionState();
+                
+                _avatarData.CreatedAt = DateTime.Now;
+                _avatarData.UpdatedAt = DateTime.MinValue;
+                _lastUpdatedLabel.parent.AddToClassList("d-none");
+                _versionLabel.parent.AddToClassList("d-none");
+                _fallbackInfo.parent.AddToClassList("d-none");
+
+                platformsBlock.parent.AddToClassList("d-none");
+                
+                switch (pm.fallbackStatus)
+                {
+                    case PipelineManager.FallbackStatus.Valid:
+                        CurrentFallbackStatus = FallbackStatus.Compatible;
+                        break;
+                    default:
+                        CurrentFallbackStatus = FallbackStatus.Incompatible;
+                        break;
+                }
+                
+                _creationChecklist.RemoveFromClassList("d-none");
+                _creationChecklist.Items = new List<Checklist.ChecklistItem>
+                {
+                    new Checklist.ChecklistItem
+                    {
+                        Value = "name",
+                        Label = "Give your avatar a name",
+                        Checked = false
+                    },
+                    new Checklist.ChecklistItem
+                    {
+                        Value = "thumbnail",
+                        Label = "Select a thumbnail image",
+                        Checked = false
+                    },
+                    new Checklist.ChecklistItem
+                    {
+                        Value = "build",
+                        Label = "Click \"Build & Publish\"",
+                        Checked = false
+                    },
+                };
+
+                ValidateChecklist();
+            }
+            else
+            {
+                AvatarBuilderSessionState.Clear();
+                
+                platformsBlock.parent.RemoveFromClassList("d-none");
+                _creationChecklist.AddToClassList("d-none");
+            
+                _nameField.value = _avatarData.Name;
+                _descriptionField.value = _avatarData.Description;
+                _visibilityPopup.value = _avatarData.ReleaseStatus;
+                
+                _lastUpdatedLabel.text = (_avatarData.UpdatedAt != DateTime.MinValue ? _avatarData.UpdatedAt : _avatarData.CreatedAt).ToLocalTime().ToString(CultureInfo.CurrentCulture);
+                _lastUpdatedLabel.parent.RemoveFromClassList("d-none");
+                
+                _versionLabel.text = _avatarData.Version.ToString();
+                _versionLabel.parent.RemoveFromClassList("d-none");
+
+                _fallbackInfo.parent.RemoveFromClassList("d-none");
+
+                var platforms = new HashSet<string>();
+                foreach (var p in _avatarData.UnityPackages.Select(p => VRCSdkControlPanel.CONTENT_PLATFORMS_MAP[p.Platform]))
+                {
+                    platforms.Add(p);
+                }
+                platformsBlock.text = string.Join(", ", platforms);
+                
+                await _thumbnail.SetImageUrl(_avatarData.ThumbnailImageUrl, _avatarSwitchCancellationToken.Token);
+                
+                if (APIUser.CurrentUser.fallbackId == _avatarData.ID)
+                {
+                    CurrentFallbackStatus = FallbackStatus.Selected;
+                }
+                else
+                {
+                    switch (pm.fallbackStatus)
+                    {
+                        case PipelineManager.FallbackStatus.Valid:
+                            if (platforms.Contains("Windows") && platforms.Contains("Android") && Tools.Platform == "android")
+                            {
+                                CurrentFallbackStatus = FallbackStatus.Selectable;
+                            }
+                            else
+                            {
+                                CurrentFallbackStatus = FallbackStatus.Compatible;
+                            }
+                            break;
+                        default:
+                            CurrentFallbackStatus = FallbackStatus.Incompatible;
+                            break;
                     }
                 }
             }
+            
+            _nameField.Loading = false;
+            _descriptionField.Loading = false;
+            _thumbnail.Loading = false;
+            UiEnabled = true;
 
-            EditorGUILayout.EndVertical();
-            EditorGUILayout.Space();
+            var avatarTags = _avatarData.Tags ?? new List<string>();
+            _originalAvatarData = _avatarData;
+            // lists get passed by reference, so we instantiate a new list to avoid modifying the original
+            _originalAvatarData.Tags = new List<string>(avatarTags);
 
-            EditorGUILayout.EndHorizontal();
-            EditorGUILayout.EndVertical();
+            _contentWarningsField.originalTags = _originalAvatarData.Tags;
+            _contentWarningsField.tags = avatarTags;
+            _contentWarningsField.OnToggleTag += HandleToggleTag;
 
-            GUI.enabled = true;
+            _nameField.RegisterValueChangedCallback(HandleNameChange);
+            _descriptionField.RegisterValueChangedCallback(HandleDescriptionChange);
+            _visibilityPopup.RegisterValueChangedCallback(HandleVisibilityChange);
+            _thumbnailFoldout.OnNewThumbnailSelected += HandleThumbnailChanged;
+            
+            _discardChangesButton.clicked += HandleDiscardChangesClick;
+            _saveChangesButton.clicked += HandleSaveChangesClick;
+
+            root.schedule.Execute(CheckBlueprintChanges).Every(1000);
         }
 
-        private static void OnGUIAvatarSettings(VRC_AvatarDescriptor avatar)
+        private void RestoreSessionState()
         {
-            EditorGUILayout.BeginVertical(VRCSdkControlPanel.boxGuiStyle, GUILayout.Width(VRCSdkControlPanel.SdkWindowWidth));
+            _avatarData.Name = AvatarBuilderSessionState.AvatarName;
+            _nameField.SetValueWithoutNotify(_avatarData.Name);
 
-            string name = "Unpublished Avatar - " + avatar.gameObject.name;
-            if (avatar.apiAvatar != null)
-                name = (avatar.apiAvatar as Core.ApiAvatar)?.name;
-            EditorGUILayout.Space();
-            EditorGUILayout.LabelField(name, VRCSdkControlPanel.titleGuiStyle);
+            _avatarData.Description = AvatarBuilderSessionState.AvatarDesc;
+            _descriptionField.SetValueWithoutNotify(_avatarData.Description);
+            
+            _avatarData.ReleaseStatus = AvatarBuilderSessionState.AvatarReleaseStatus;
+            _visibilityPopup.SetValueWithoutNotify(_avatarData.ReleaseStatus);
 
-            Core.PipelineManager pm = avatar.GetComponent<Core.PipelineManager>();
-            if (pm != null && !string.IsNullOrEmpty(pm.blueprintId))
+            _contentWarningsField.tags = _avatarData.Tags = new List<string>(AvatarBuilderSessionState.AvatarTags.Split('|'));
+            
+            _newThumbnailImagePath = AvatarBuilderSessionState.AvatarThumbPath;
+            if (!string.IsNullOrWhiteSpace(_newThumbnailImagePath))
+                _thumbnail.SetImage(_newThumbnailImagePath);
+        }
+
+        #region Event Handlers
+
+        private void HandlePanelDetach(DetachFromPanelEvent evt)
+        {
+            EditorSceneManager.sceneClosed -= HandleSceneClosed;
+        }
+
+        // This auto-cancels uploads when the user changes scenes
+        private void HandleSceneClosed(Scene scene)
+        {
+            _avatarSwitchCancellationToken.Cancel();
+            _avatarSwitchCancellationToken = new CancellationTokenSource();
+            
+            if (_avatarUploadCancellationTokenSource == null) return;
+            _avatarUploadCancellationTokenSource.Cancel();
+            _avatarUploadCancellationTokenSource = null;
+        }
+
+        private void HandleSdkPanelDisable(object sender, EventArgs evt)
+        {
+            _avatarSwitchCancellationToken.Cancel();
+            _avatarSwitchCancellationToken = new CancellationTokenSource();
+            
+            if (_avatarUploadCancellationTokenSource == null) return;
+            _avatarUploadCancellationTokenSource.Cancel();
+            _avatarUploadCancellationTokenSource = null;
+        }
+
+        
+        private void HandleFoldoutToggle(ChangeEvent<bool> evt)
+        {
+            SessionState.SetBool($"{AvatarBuilderSessionState.SESSION_STATE_PREFIX}.Foldout.{((VisualElement) evt.currentTarget).name}", evt.newValue);
+        }
+
+        private void HandleNameChange(ChangeEvent<string> evt)
+        {
+            _avatarData.Name = evt.newValue;
+            if (IsNewAvatar)
+                AvatarBuilderSessionState.AvatarName = _avatarData.Name;
+
+            // do not allow empty names
+            _saveChangesButton.SetEnabled(!string.IsNullOrWhiteSpace(evt.newValue));
+            IsContentInfoDirty = CheckDirty();
+
+            ValidateChecklist();
+        }
+
+        private void HandleDescriptionChange(ChangeEvent<string> evt)
+        {
+            _avatarData.Description = evt.newValue;
+            if (IsNewAvatar)
+                AvatarBuilderSessionState.AvatarDesc = _avatarData.Description;
+
+            IsContentInfoDirty = CheckDirty();
+        }
+        
+        private void HandleToggleTag(object sender, string tag)
+        {
+            if (_avatarData.Tags == null)
+                _avatarData.Tags = new List<string>();
+
+            if (_avatarData.Tags.Contains(tag))
+                _avatarData.Tags.Remove(tag);
+            else
+                _avatarData.Tags.Add(tag);
+
+            _contentWarningsField.tags = _avatarData.Tags;
+            if (IsNewAvatar)
+                AvatarBuilderSessionState.AvatarTags = string.Join("|", _avatarData.Tags);
+
+            IsContentInfoDirty = CheckDirty();
+        }
+
+        private void HandleVisibilityChange(ChangeEvent<string> evt)
+        {
+            _avatarData.ReleaseStatus = evt.newValue;
+
+            if (IsNewAvatar)
+                AvatarBuilderSessionState.AvatarReleaseStatus = evt.newValue;
+            
+            IsContentInfoDirty = CheckDirty();
+        }
+
+        private void HandleThumbnailChanged(object sender, string imagePath)
+        {
+            if (string.IsNullOrWhiteSpace(imagePath)) return;
+            
+            _newThumbnailImagePath = imagePath;
+            if (IsNewAvatar)
+                AvatarBuilderSessionState.AvatarThumbPath = _newThumbnailImagePath;
+            
+            _thumbnail.SetImage(_newThumbnailImagePath);
+            IsContentInfoDirty = CheckDirty();
+
+            ValidateChecklist();
+        }
+
+        private async void HandleDiscardChangesClick()
+        {
+            _avatarData = _originalAvatarData;
+            _contentWarningsField.tags = _avatarData.Tags = new List<string>(_originalAvatarData.Tags);
+            _nameField.value = _avatarData.Name;
+            _descriptionField.value = _avatarData.Description;
+            _visibilityPopup.value = _avatarData.ReleaseStatus;
+            _lastUpdatedLabel.text = _avatarData.UpdatedAt != DateTime.MinValue ? _avatarData.UpdatedAt.ToString() : _avatarData.CreatedAt.ToString();
+            _versionLabel.text = _avatarData.Version.ToString();
+
+            _nameField.Reset();
+            _descriptionField.Reset();
+            _newThumbnailImagePath = null;
+            await _thumbnail.SetImageUrl(_avatarData.ThumbnailImageUrl, _avatarSwitchCancellationToken.Token);
+            IsContentInfoDirty = false;
+        }
+
+        private async void HandleSaveChangesClick()
+        {
+            UiEnabled = false;
+
+            if (_nameField.IsPlaceholder() || string.IsNullOrWhiteSpace(_nameField.text))
             {
-                if (avatar.apiAvatar == null)
+                Debug.LogError("Name cannot be empty");
+                return;
+            }
+
+            if (_descriptionField.IsPlaceholder())
+            {
+                _avatarData.Description = "";
+            }
+
+            _avatarUploadCancellationTokenSource = new CancellationTokenSource();
+            _avatarUploadCancellationToken = _avatarUploadCancellationTokenSource.Token;
+            
+            if (!string.IsNullOrWhiteSpace(_newThumbnailImagePath))
+            {
+                _progressBar.style.width = 0f;
+
+                // to avoid loss of exceptions, we hoist it into a local function
+                async void Progress(string status, float percentage)
                 {
-                    Core.ApiAvatar av = Core.API.FromCacheOrNew<Core.ApiAvatar>(pm.blueprintId);
-                    av.Fetch(
-                        c => avatar.apiAvatar = c.Model as Core.ApiAvatar,
-                        c =>
+                    // these callbacks can be dispatched off-thread, so we ensure we're main thread pinned
+                    await UniTask.SwitchToMainThread();
+                    ProgressBarState = new ProgressBarStateData
+                    {
+                        Visible = true,
+                        Progress = percentage * 0.8f,
+                        Text = status
+                    };
+                }
+                
+                _newThumbnailImagePath = VRC_EditorTools.CropImage(_newThumbnailImagePath, 800, 600, true);
+                var updatedAvatar = await VRCApi.UpdateAvatarImage(
+                    _avatarData.ID,
+                    _avatarData,
+                    _newThumbnailImagePath,
+                    Progress, _avatarUploadCancellationToken);
+                
+                // also need to update the base avatar data
+                if (!AvatarDataEqual())
+                {
+                    ProgressBarState = new ProgressBarStateData
+                    {
+                        Visible = true,
+                        Text = "Saving Avatar Changes...",
+                        Progress = 1f
+                    };
+                    updatedAvatar = await VRCApi.UpdateAvatarInfo(_avatarData.ID, _avatarData, _avatarUploadCancellationToken);
+                }
+                _avatarData = updatedAvatar;
+                _originalAvatarData = updatedAvatar;
+                await _thumbnail.SetImageUrl(_avatarData.ThumbnailImageUrl, _avatarSwitchCancellationToken.Token);
+                _contentWarningsField.originalTags = _originalAvatarData.Tags = new List<string>(_avatarData.Tags ?? new List<string>());
+                _contentWarningsField.tags = _avatarData.Tags ?? new List<string>();
+                _newThumbnailImagePath = null;
+            }
+            else
+            {
+                ProgressBarState = new ProgressBarStateData
+                {
+                    Visible = true,
+                    Text = "Saving Avatar Changes...",
+                    Progress = 1f
+                };
+                Core.Logger.Log("Updating avatar");
+                var updatedAvatar = await VRCApi.UpdateAvatarInfo(_avatarData.ID, _avatarData, _avatarUploadCancellationToken);
+                Core.Logger.Log("Updated avatar");
+                _avatarData = updatedAvatar;
+                _originalAvatarData = updatedAvatar;
+                _contentWarningsField.originalTags = _originalAvatarData.Tags = new List<string>(_avatarData.Tags ?? new List<string>());
+                _contentWarningsField.tags = _avatarData.Tags ?? new List<string>();
+            }
+
+            UpdateCancelEnabled = false;
+            ProgressBarState = false;
+
+
+            UiEnabled = true;
+            _nameField.value = _avatarData.Name;
+            _descriptionField.value = _avatarData.Description;
+            _visibilityPopup.value = _avatarData.ReleaseStatus;
+            _lastUpdatedLabel.text = _avatarData.UpdatedAt != DateTime.MinValue ? _avatarData.UpdatedAt.ToString(): _avatarData.CreatedAt.ToString();
+            _versionLabel.text = _avatarData.Version.ToString();
+
+            _nameField.Reset();
+            _descriptionField.Reset();
+            IsContentInfoDirty = false;
+        }
+        #endregion
+
+        private void ValidateChecklist()
+        {
+            _creationChecklist.MarkItem("name", !string.IsNullOrWhiteSpace(_avatarData.Name));
+            _creationChecklist.MarkItem("thumbnail", !string.IsNullOrWhiteSpace(_newThumbnailImagePath));
+        }
+
+        private bool AvatarDataEqual()
+        {
+            return _avatarData.Name.Equals(_originalAvatarData.Name) &&
+                   _avatarData.Description.Equals(_originalAvatarData.Description) &&
+                   _avatarData.Tags.SequenceEqual(_originalAvatarData.Tags) &&
+                   _avatarData.ReleaseStatus.Equals(_originalAvatarData.ReleaseStatus);
+        }
+        
+        private bool CheckDirty()
+        {
+            // we ignore the diffs for new avatars, since they're not published yet
+            if (IsNewAvatar) return false;
+            if (string.IsNullOrWhiteSpace(_avatarData.ID) || string.IsNullOrWhiteSpace(_originalAvatarData.ID))
+                return false;
+            return !AvatarDataEqual()|| !string.IsNullOrWhiteSpace(_newThumbnailImagePath);
+        }
+        
+        private void CheckBlueprintChanges()
+        {
+            if (!UiEnabled) return;
+            if (_selectedAvatar == null) return;
+            if (!_selectedAvatar.TryGetComponent<PipelineManager>(out var pm)) return;
+            if (_lastBlueprintId == pm.blueprintId) return;
+            HandleAvatarSwitch(_visualRoot);
+            _lastBlueprintId = pm.blueprintId;
+        }
+
+        private bool _acceptedTerms;
+        public void CreateBuildGUI(VisualElement root)
+        {
+            var tree = Resources.Load<VisualTreeAsset>("VRCSdkAvatarBuilderBuildLayout");
+            tree.CloneTree(root);
+            
+            root.Q<Button>("show-local-test-help-button").clicked += () =>
+            {
+                root.Q("local-test-help-text").ToggleInClassList("d-none");
+            };
+            root.Q<Button>("show-online-publishing-help-button").clicked += () =>
+            {
+                root.Q("online-publishing-help-text").ToggleInClassList("d-none");
+            };
+            
+            _buildAndTestButton = root.Q<Button>("build-and-test-button");
+            _localTestDisabledBlock = root.Q("local-test-disabled-block");
+            _localTestDisabledText = root.Q<Label>("local-test-disabled-text");
+            _acceptTermsToggle = root.Q<Toggle>("accept-terms-toggle");
+            _v3Block = root.Q("v3-block");
+
+            _acceptTermsToggle.RegisterValueChangedCallback(evt =>
+            {
+                _acceptedTerms = evt.newValue;
+            });
+
+#if UNITY_ANDROID || UNITY_IOS
+            _buildAndTestButton.SetEnabled(false);
+            _localTestDisabledBlock.RemoveFromClassList("d-none");
+            _localTestDisabledText.text = "Building and testing on this platform is not supported.";
+#endif
+
+            _buildAndTestButton.clicked += async () =>
+            {
+                UiEnabled = false;
+
+                async void BuildSuccess(object sender, string path)
+                {
+                    ProgressBarState = new ProgressBarStateData
+                    {
+                        Visible = true,
+                        Text = "Avatar Built",
+                        Progress = 1f
+                    };
+
+                    await Task.Delay(500);
+                    ProgressBarState = false;
+                    UiEnabled = true;
+
+                    ShowBuildSuccessNotification(true);
+                    
+                    _thumbnail.Loading = false;
+                    RevertThumbnail();
+                }
+
+                OnSdkBuildStart += BuildStart;
+                OnSdkBuildError += BuildError;
+                OnSdkBuildSuccess += BuildSuccess;
+
+                try
+                {
+                    await BuildAndTest(_selectedAvatar.gameObject);
+                }
+                finally
+                {
+                    OnSdkBuildStart -= BuildStart;
+                    OnSdkBuildError -= BuildError;
+                    OnSdkBuildSuccess -= BuildSuccess;
+                }
+            };
+            
+            _buildAndUploadButton = root.Q<Button>("build-and-upload-button");
+            _uploadDisabledBlock = root.Q<VisualElement>("build-and-upload-disabled-block");
+            _uploadDisabledText = _uploadDisabledBlock.Q<Label>("build-and-upload-disabled-text");
+            
+            _buildAndUploadButton.clicked += async () =>
+            {
+                UiEnabled = false;
+
+                void BuildSuccess(object sender, string path)
+                {
+                    ProgressBarState = new ProgressBarStateData
+                    {
+                        Visible = true,
+                        Text = "Avatar Built",
+                        Progress = 0.1f,
+                    };
+                }
+
+                OnSdkBuildStart += BuildStart;
+                OnSdkBuildError += BuildError;
+                OnSdkBuildSuccess += BuildSuccess;
+                
+                OnSdkUploadStart += UploadStart;
+                OnSdkUploadProgress += UploadProgress;
+                OnSdkUploadError += UploadError;
+                OnSdkUploadSuccess += UploadSuccess;
+                OnSdkUploadFinish += UploadFinish;
+
+                _avatarUploadCancellationTokenSource = new CancellationTokenSource();
+
+                try
+                {
+                    await BuildAndUpload(_selectedAvatar.gameObject, _avatarData, _newThumbnailImagePath,
+                        _avatarUploadCancellationTokenSource.Token);
+                }
+                finally
+                {
+                    
+                    OnSdkBuildStart -= BuildStart;
+                    OnSdkBuildError -= BuildError;
+                    OnSdkBuildSuccess -= BuildSuccess;
+
+                    OnSdkUploadStart -= UploadStart;
+                    OnSdkUploadProgress -= UploadProgress;
+                    OnSdkUploadError -= UploadError;
+                    OnSdkUploadSuccess -= UploadSuccess;
+                    OnSdkUploadFinish -= UploadFinish;
+                }
+            };
+            
+            SetupExtraPanelUI();
+
+            root.schedule.Execute(() =>
+            {
+                if (_selectedAvatar == null) return;
+                
+                var localBuildsAllowed = (EditorUserBuildSettings.activeBuildTarget == BuildTarget.StandaloneWindows ||
+                                          EditorUserBuildSettings.activeBuildTarget == BuildTarget.StandaloneWindows64) &&
+                                         ((_builder.NoGuiErrorsOrIssuesForItem(_selectedAvatar) && _builder.NoGuiErrorsOrIssuesForItem(_builder)) || APIUser.CurrentUser.developerType ==
+                                             APIUser.DeveloperType.Internal);
+                
+                _localTestDisabledBlock.EnableInClassList("d-none", localBuildsAllowed);
+                if (localBuildsAllowed)
+                {
+                    _localTestDisabledText.text =
+                        "You must fix the issues listed above before you can do an Offline Test";
+                }
+
+                if (!_acceptedTerms)
+                {
+                    _uploadDisabledText.text = "You must accept the terms above to upload content to VRChat";
+                    _uploadDisabledBlock.RemoveFromClassList("d-none");
+                    return;
+                }
+                else
+                {
+                    _uploadDisabledBlock.AddToClassList("d-none");
+                }
+                
+                if (IsNewAvatar && (string.IsNullOrWhiteSpace(_avatarData.Name) || string.IsNullOrWhiteSpace(_newThumbnailImagePath)))
+                {
+                    _uploadDisabledText.text = "Please set a name and thumbnail before uploading";
+                    _uploadDisabledBlock.RemoveFromClassList("d-none");
+                    return;
+                }
+                else
+                {
+                    _uploadDisabledText.text = "You must fix the issues listed above before you can Upload a Build";
+                }
+                
+                var uploadsAllowed = (_builder.NoGuiErrorsOrIssuesForItem(_selectedAvatar) && _builder.NoGuiErrorsOrIssuesForItem(_builder)) ||
+                           APIUser.CurrentUser.developerType == APIUser.DeveloperType.Internal;
+                _uploadDisabledBlock.EnableInClassList("d-none", uploadsAllowed);
+                
+            }).Every(1000);
+        }
+        
+        public virtual void SetupExtraPanelUI()
+        {
+            
+        }
+
+        private async Task<string> Build(GameObject target, bool testAvatar)
+        {
+            if (target == null) return null;
+            
+            var buildBlocked =
+                    !VRCBuildPipelineCallbacks.OnVRCSDKBuildRequested(VRCSDKRequestedBuildType.Avatar);
+            if (buildBlocked)
+            {
+                throw await HandleBuildError(new BuildBlockedException("Build was blocked by the SDK callback"));
+            }
+            
+            if (!APIUser.CurrentUser.canPublishAvatars)
+            {
+                VRCSdkControlPanel.ShowContentPublishPermissionsDialog();
+                throw await HandleBuildError(new BuildBlockedException("Current User does not have permissions to build avatars"));
+            }
+
+            if (_builder == null)
+            {
+                throw await HandleBuildError(new BuilderException("Open the SDK panel to build and upload avatars"));
+            }
+
+            var originalFogSettings = EnvConfig.GetFogSettings();
+            EnvConfig.SetFogSettings(
+                new EnvConfig.FogSettings(EnvConfig.FogSettings.FogStrippingMode.Custom, true, true, true));
+
+#if UNITY_ANDROID
+            EditorPrefs.SetBool("VRC.SDKBase_StripAllShaders", true);
+#else
+            EditorPrefs.SetBool("VRC.SDKBase_StripAllShaders", false);
+#endif
+            
+            if (!target.TryGetComponent<PipelineManager>(out _))
+            {
+                throw await HandleBuildError(new BuilderException("This avatar does not have a PipelineManager"));
+            }
+
+            VRC_SdkBuilder.shouldBuildUnityPackage = false;
+            VRC_SdkBuilder.ClearCallbacks();
+
+            var successTask = new TaskCompletionSource<string>();
+            var errorTask = new TaskCompletionSource<string>();
+            var validationTask = new TaskCompletionSource<object>();
+            VRC_SdkBuilder.RegisterBuildProgressCallback((sender, status) =>
+            {
+                OnSdkBuildProgress?.Invoke(sender, status);
+            });
+            VRC_SdkBuilder.RegisterBuildContentProcessedCallback((sender, processedAvatar) =>
+            {
+                var avatarObject = (GameObject) processedAvatar;
+                if (avatarObject == null) return;
+                if (!avatarObject.TryGetComponent<VRCAvatarDescriptor>(out var descriptor)) return;
+                GenerateDebugHashset(descriptor);
+                
+                if (!descriptor.TryGetComponent<Animator>(out var animator));//修改
+                //if (!animator.isHuman) return;//修改
+                    
+                // re-save the layer masks for base layers after potential modifications
+                var sO = new SerializedObject(descriptor);
+                var baseLayers = sO.FindProperty("baseAnimationLayers");
+                for (int i = 0; i < baseLayers.arraySize; i++)
+                {
+                    var layer = baseLayers.GetArrayElementAtIndex(i);
+                    var type = (VRCAvatarDescriptor.AnimLayerType)layer.FindPropertyRelative("type").enumValueIndex;
+                    switch (type)
+                    {
+                        case VRCAvatarDescriptor.AnimLayerType.FX:
+                            SetLayerMaskFromControllerInternal(layer);
+                            break;
+                        case VRCAvatarDescriptor.AnimLayerType.Gesture:
+                            SetLayerMaskFromControllerInternal(layer);
+                            break;
+                    }
+                }
+            });
+            VRC_SdkBuilder.RegisterBuildContentProcessedCallback(async (sender, processedAvatar) =>
+            {
+                var avatarObject = (GameObject) processedAvatar;
+                if (avatarObject == null)
+                {
+                    validationTask.SetResult(null);
+                    return;
+                }
+
+                if (!avatarObject.TryGetComponent<VRCAvatarDescriptor>(out var descriptor))
+                {
+                    validationTask.SetResult(null);
+                    return;
+                }
+                
+                try
+                {
+                    await CheckAvatarForValidationIssues(descriptor);
+                }
+                catch (Exception e)
+                {
+                    if (e is ValidationException validationException)
+                    {
+                        Debug.LogError("Encountered the following validation issues during build:");
+                        foreach (var error in validationException.Errors)
                         {
-                            if (c.Code == 404)
-                            {
-                                Core.Logger.Log(
-                                    $"Could not load avatar {pm.blueprintId} because it didn't exist.",
-                                    Core.DebugLevel.API);
-                                Core.ApiCache.Invalidate<Core.ApiWorld>(pm.blueprintId);
-                            }
-                            else
-                                Debug.LogErrorFormat("Could not load avatar {0} because {1}", pm.blueprintId, c.Error);
-                        });
-                    avatar.apiAvatar = av;
+                            Debug.LogError(error);
+                        }
+                    }
+                    errorTask.TrySetResult(e.Message);
+                    return;
+                }
+
+                try
+                {
+                    validationTask.SetResult(null);
+                }
+                catch (Exception)
+                {
+                    // this happens if the task is already completed, probably ok to ignore.
+                }
+            });
+            VRC_SdkBuilder.RegisterBuildErrorCallback((sender, error) =>
+            {
+                errorTask.TrySetResult(error);
+            });
+            VRC_SdkBuilder.RegisterBuildSuccessCallback((sender, path) =>
+            {
+                successTask.TrySetResult(path);
+            });
+            
+            VRC_EditorTools.GetSetPanelBuildingMethod().Invoke(_builder, null);
+            OnSdkBuildStart?.Invoke(this, target);
+            _buildState = SdkBuildState.Building;
+            OnSdkBuildStateChange?.Invoke(this, _buildState);
+
+            await Task.Delay(100);
+
+            if (testAvatar && Tools.Platform != "standalonewindows")
+            {
+                throw new BuilderException("Avatar testing is only supported on Windows");
+            }
+
+            if (testAvatar)
+            {
+                try
+                {
+                    VRC_SdkBuilder.RunExportAndTestAvatarBlueprint(target);
+                }
+                catch
+                {
+                    // Errors are handled by the error callback
+                }
+            }
+            else
+            {
+                try
+                {
+                    VRC_SdkBuilder.RunExportAvatarBlueprint(target);
+                }
+                catch
+                {
+                    // Errors are handled by the error callback
                 }
             }
 
-            if (avatar.apiAvatar != null)
+            // wait for avatar validations to finish first
+            var avatarProcessedTask = Task.WhenAll(successTask.Task, validationTask.Task);
+            var result = await Task.WhenAny(avatarProcessedTask, errorTask.Task);
+
+            string bundlePath = null;
+            bundlePath = result == avatarProcessedTask ? successTask.Task.Result : null;
+            
+            VRC_SdkBuilder.ClearCallbacks();
+            EnvConfig.SetFogSettings(originalFogSettings);
+			//修改
+			#if UNITY_EDITOR
+			if (UnityEditor.EditorUtility.DisplayDialog("提示", "是否要繼續執行?", "繼續"))
+			#endif
+			//修改
+            if (bundlePath == null)
             {
-                Core.ApiAvatar a = (avatar.apiAvatar as Core.ApiAvatar);
-                DrawContentInfoForAvatar(a);
-                VRCSdkControlPanel.DrawContentPlatformSupport(a);
+                throw await HandleBuildError(new BuilderException(errorTask.Task.Status == TaskStatus.RanToCompletion ? errorTask.Task.Result : "Unexpected Error Occurred"));
+            }
+            else
+            {
+                _buildState = SdkBuildState.Success;
+                OnSdkBuildSuccess?.Invoke(this, bundlePath);
+                OnSdkBuildStateChange?.Invoke(this, _buildState);
             }
 
-            VRCSdkControlPanel.DrawBuildTargetSwitcher();
-            EditorGUILayout.EndVertical();
-        }
+            await FinishBuild();
 
-        private static void DrawContentInfoForAvatar(Core.ApiAvatar a)
+            return bundlePath;
+        }
+        
+        private async Task FinishBuild()
         {
-            VRCSdkControlPanel.DrawContentInfo(a.name, a.version.ToString(), a.description, null, a.releaseStatus,
-                a.tags);
+            await Task.Delay(100);
+            _buildState = SdkBuildState.Idle;
+            OnSdkBuildFinish?.Invoke(this, "Avatar build finished");
+            OnSdkBuildStateChange?.Invoke(this, _buildState);
+            VRC_EditorTools.GetSetPanelIdleMethod().Invoke(_builder, null);
         }
 
-        protected static Action GetAvatarSubSelectAction(Component avatar, Type[] types)
+        private async Task<Exception> HandleBuildError(Exception exception)
+        {
+            OnSdkBuildError?.Invoke(this, exception.Message);
+            _buildState = SdkBuildState.Failure;
+            OnSdkBuildStateChange?.Invoke(this, _buildState);
+
+            await FinishBuild();
+            return exception;
+        }
+
+        #region Build Callbacks
+
+        private async void BuildStart(object sender, object target)
+        {
+            UiEnabled = false;
+            _thumbnail.Loading = true;
+            _thumbnail.ClearImage();
+            if (IsNewAvatar)
+            {
+                _creationChecklist.MarkItem("build", true);
+                await Task.Delay(100);
+            }
+            
+            ProgressBarState = new ProgressBarStateData
+            {
+                Visible = true,
+                Text = "Building Avatar",
+                Progress = 0.0f
+            };
+        }
+        private async void BuildError(object sender, string error)
+        {
+            Core.Logger.Log("Failed to build avatar!");
+            Core.Logger.LogError(error);
+
+            await Task.Delay(100);
+            ProgressBarState = false;
+            UiEnabled = true;
+            
+            _thumbnail.Loading = false;
+            RevertThumbnail();
+            
+            await _builder.ShowBuilderNotification(
+                "Build Failed",
+                new AvatarUploadErrorNotification(error),
+                "red"
+            );
+        }
+
+        private async void RevertThumbnail()
+        {
+            if (IsNewAvatar)
+            {
+                _thumbnail.SetImage(_newThumbnailImagePath);
+            }
+            else
+            {
+                await _thumbnail.SetImageUrl(_avatarData.ThumbnailImageUrl, _avatarSwitchCancellationToken.Token);
+            }
+        }
+
+        private void UploadStart(object sender, EventArgs e)
+        {
+            _thumbnail.Loading = true;
+            _thumbnail.ClearImage();
+            UpdateCancelEnabled = true;
+            _updateCancelButton.clicked += CancelUpload;
+            VRC_EditorTools.ToggleSdkTabsEnabled(_builder, false);
+        }
+
+        private async void UploadProgress(object sender, (string status, float percentage) progress)
+        {
+            await UniTask.SwitchToMainThread();
+            ProgressBarState = new ProgressBarStateData
+            {
+                Visible = true,
+                Text = progress.status,
+                Progress = 0.2f + progress.percentage * 0.8f
+            };
+            _progressBlock.MarkDirtyRepaint();
+        }
+        private async void UploadSuccess(object sender, string avatarId)
+        {
+            await Task.Delay(100);
+            UpdateCancelEnabled = false;
+            ProgressBarState = false;
+            UiEnabled = true;
+
+            _originalAvatarData = _avatarData;
+            _originalAvatarData.Tags = new List<string>(_avatarData.Tags ?? new List<string>());
+            _newThumbnailImagePath = null;
+
+            await _builder.ShowBuilderNotification(
+                "Upload Succeeded!",
+                new AvatarUploadSuccessNotification(avatarId),
+                "green"
+            );
+            
+            HandleAvatarSwitch(_visualRoot);
+        }
+        private async void UploadError(object sender, string error)
+        {
+            Core.Logger.Log("Failed to upload avatar!");
+            Core.Logger.LogError(error);
+            
+            await Task.Delay(100);
+            UpdateCancelEnabled = false;
+            ProgressBarState = false;
+            UiEnabled = true;
+            _thumbnail.Loading = false;
+            RevertThumbnail();
+            
+            await _builder.ShowBuilderNotification(
+                "Upload Failed",
+                new AvatarUploadErrorNotification(error),
+                "red"
+            );
+        }
+
+        private void UploadFinish(object sender, string message)
+        {
+            _updateCancelButton.clicked -= CancelUpload;
+        }
+
+        private async void ShowBuildSuccessNotification(bool testBuild = false)
+        {
+            await _builder.ShowBuilderNotification(
+                "Build Succeeded!",
+                new AvatarBuildSuccessNotification(testBuild),
+                "green"
+            );
+        }
+
+        #endregion
+
+        #endregion
+
+        #region Public API Backing
+
+        private SdkBuildState _buildState;
+        private SdkUploadState _uploadState;
+        
+        private static CancellationTokenSource _avatarUploadCancellationTokenSource;
+        private CancellationToken _avatarUploadCancellationToken;
+
+        #endregion
+
+        #region Public API
+        
+        public event EventHandler<object> OnSdkBuildStart;
+        public event EventHandler<string> OnSdkBuildProgress;
+        public event EventHandler<string> OnSdkBuildFinish;
+        public event EventHandler<string> OnSdkBuildSuccess;
+        public event EventHandler<string> OnSdkBuildError;
+        public event EventHandler<SdkBuildState> OnSdkBuildStateChange;
+        public SdkBuildState BuildState => _buildState;
+        
+        public event EventHandler OnSdkUploadStart;
+        public event EventHandler<(string status, float percentage)> OnSdkUploadProgress;
+        public event EventHandler<string> OnSdkUploadFinish;
+        public event EventHandler<string> OnSdkUploadSuccess;
+        public event EventHandler<string> OnSdkUploadError;
+        public event EventHandler<SdkUploadState> OnSdkUploadStateChange;
+        public SdkUploadState UploadState => _uploadState;
+
+        public async Task<string> Build(GameObject target)
+        {
+            return await Build(target, false);
+        }
+
+        public async Task BuildAndUpload(GameObject target, VRCAvatar avatar, string thumbnailPath = null, CancellationToken cancellationToken = default)
+        {
+            if (cancellationToken == default)
+            {
+                _avatarUploadCancellationTokenSource = new CancellationTokenSource();
+                _avatarUploadCancellationToken = _avatarUploadCancellationTokenSource.Token;
+            }
+            else
+            {
+                _avatarUploadCancellationToken = cancellationToken;
+            }
+            
+            var bundlePath = await Build(target);
+
+            if (string.IsNullOrWhiteSpace(bundlePath) || !File.Exists(bundlePath))
+            {
+                throw await HandleUploadError(new UploadException("Failed to find the built avatar bundle, the build likely failed"));
+            }
+
+            if (ValidationHelpers.CheckIfAssetBundleFileTooLarge(ContentType.Avatar, bundlePath, out int fileSize,
+                    VRC.Tools.Platform != "standalonewindows"))
+            {
+                var limit = ValidationHelpers.GetAssetBundleSizeLimit(ContentType.Avatar,
+                    Tools.Platform != "standalonewindows");
+                throw await HandleUploadError(new UploadException(
+                    $"Avatar is too large for the target platform. {(fileSize / 1024 / 1024):F2} MB > {(limit / 1024 / 1024):F2} MB"));
+                    
+            }
+
+            VRC_EditorTools.GetSetPanelUploadingMethod().Invoke(_builder, null);
+            _uploadState = SdkUploadState.Uploading;
+            OnSdkUploadStateChange?.Invoke(this, _uploadState);
+            OnSdkUploadStart?.Invoke(this, EventArgs.Empty);
+
+            await Task.Delay(100, _avatarUploadCancellationToken);
+            
+            if (!target.TryGetComponent<PipelineManager>(out var pM))
+            {
+                throw await HandleUploadError(new UploadException("Target avatar does not have a PipelineManager, make sure a PipelineManager component is present before uploading"));
+            }
+            
+            var creatingNewAvatar = string.IsNullOrWhiteSpace(pM.blueprintId) || string.IsNullOrWhiteSpace(avatar.ID);
+
+            if (creatingNewAvatar && (string.IsNullOrWhiteSpace(thumbnailPath) || !File.Exists(thumbnailPath)))
+            {
+                throw await HandleUploadError(new UploadException("You must provide a path to the thumbnail image when creating a new avatar"));
+            }
+
+            if (!creatingNewAvatar)
+            {
+                var remoteData = await VRCApi.GetAvatar(avatar.ID, cancellationToken: _avatarUploadCancellationToken);
+                if (APIUser.CurrentUser == null || remoteData.AuthorId != APIUser.CurrentUser?.id)
+                {
+                    throw await HandleUploadError(new OwnershipException("Avatar's current ID belongs to a different user, assign a different ID"));
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(pM.blueprintId))
+            {
+                Undo.RecordObject(pM, "Assigning a new ID");
+                pM.AssignId();
+            }
+
+            try
+            {
+                if (creatingNewAvatar)
+                {
+                    thumbnailPath = VRC_EditorTools.CropImage(thumbnailPath, 800, 600);
+                    _avatarData = await VRCApi.CreateNewAvatar(pM.blueprintId, avatar, bundlePath,
+                        thumbnailPath,
+                        (status, percentage) => { OnSdkUploadProgress?.Invoke(this, (status, percentage)); },
+                        _avatarUploadCancellationToken);
+                }
+                else
+                {
+                    if (avatar.Tags?.Contains(VRCApi.AVATAR_FALLBACK_TAG) ?? false)
+                    {
+                        if (pM.fallbackStatus == PipelineManager.FallbackStatus.InvalidPerformance ||
+                            pM.fallbackStatus == PipelineManager.FallbackStatus.InvalidRig)
+                        {
+                            avatar.Tags = avatar.Tags.Where(t => t != VRCApi.AVATAR_FALLBACK_TAG).ToList();
+                        }
+                    }
+                    _avatarData = await VRCApi.UpdateAvatarBundle(pM.blueprintId, avatar, bundlePath,
+                        (status, percentage) => { OnSdkUploadProgress?.Invoke(this, (status, percentage)); },
+                        _avatarUploadCancellationToken);
+                }
+                
+                _uploadState = SdkUploadState.Success;
+                OnSdkUploadSuccess?.Invoke(this, _avatarData.ID);
+
+                await FinishUpload();
+            }
+            catch (TaskCanceledException e)
+            {
+                AnalyticsSDK.AvatarUploadFailed(pM.blueprintId, !creatingNewAvatar);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    Core.Logger.LogError("Request cancelled", DebugLevel.API);
+                    throw await HandleUploadError(new UploadException("Request Cancelled", e));
+                }
+            }
+            catch (ApiErrorException e)
+            {
+                AnalyticsSDK.AvatarUploadFailed(pM.blueprintId, !creatingNewAvatar);
+                throw await HandleUploadError(new UploadException(e.ErrorMessage, e));
+            }
+            catch (Exception e)
+            {
+                AnalyticsSDK.AvatarUploadFailed(pM.blueprintId, !creatingNewAvatar);
+                throw await HandleUploadError(new UploadException(e.Message, e));
+            }
+        }
+        
+        private async Task FinishUpload()
+        {
+            await Task.Delay(100);
+
+            _uploadState = SdkUploadState.Idle;
+            OnSdkUploadFinish?.Invoke(this, "Avatar upload finished");
+            OnSdkUploadStateChange?.Invoke(this, _uploadState);
+            VRC_EditorTools.GetSetPanelIdleMethod().Invoke(_builder, null);
+            _avatarUploadCancellationToken = default;
+            VRC_EditorTools.ToggleSdkTabsEnabled(_builder, true);
+        }
+
+        private async Task<Exception> HandleUploadError(Exception exception)
+        {
+            OnSdkUploadError?.Invoke(this, exception.Message);
+            _uploadState = SdkUploadState.Failure;
+            OnSdkUploadStateChange?.Invoke(this, _uploadState);
+
+            await FinishUpload();
+            return exception;
+        }
+
+        public async Task BuildAndTest(GameObject target)
+        {
+            await Build(target, true);
+        }
+
+        public void CancelUpload()
+        {
+            VRC_EditorTools.GetSetPanelIdleMethod().Invoke(_builder, null);
+            if (_avatarUploadCancellationToken != default)
+            {
+                _avatarUploadCancellationTokenSource?.Cancel();
+                Core.Logger.Log("Avatar upload canceled");
+                return;
+            }
+            
+            Core.Logger.LogError("Custom cancellation token passed, you should cancel via its token source instead");
+        }
+        
+        #endregion
+        
+        #region Validation Helpers
+        
+        private async Task CheckAvatarForValidationIssues(VRC_AvatarDescriptor targetDescriptor)
+        {
+            _builder.CheckedForIssues = false;
+            _builder.ResetIssues();
+            OnGUIAvatarCheck(targetDescriptor);
+            _builder.CheckedForIssues = true;
+            if (!_builder.NoGuiErrorsOrIssuesForItem(targetDescriptor) || !_builder.NoGuiErrorsOrIssuesForItem(_builder))
+            {
+                var errorsList = new List<string>();
+                errorsList.AddRange(_builder.GetGuiErrorsOrIssuesForItem(targetDescriptor).Select(i => i.issueText));
+                errorsList.AddRange(_builder.GetGuiErrorsOrIssuesForItem(_builder).Select(i => i.issueText));
+                throw await HandleBuildError(new ValidationException("Avatar validation failed", errorsList));
+            }
+        }
+
+        
+        private static Action GetAvatarSubSelectAction(Component avatar, Type[] types)
         {
             return () =>
             {
                 List<Object> gos = new List<Object>();
                 foreach (Type t in types)
                 {
-                    Component[] components = avatar.GetComponentsInChildren(t, true);
+                    List<Component> components = avatar.gameObject.GetComponentsInChildrenExcludingEditorOnly(t, true);
                     foreach (Component c in components)
                         gos.Add(c.gameObject);
                 }
@@ -536,16 +2444,36 @@ namespace VRC.SDKBase.Editor
             };
         }
 
-        protected static Action GetAvatarSubSelectAction(Component avatar, Type type)
+        private static Action GetAvatarSubSelectAction(Component avatar, Type type)
         {
             List<Type> t = new List<Type> {type};
             return GetAvatarSubSelectAction(avatar, t.ToArray());
         }
 
+        private static Action GetAvatarAudioSourcesWithDecompressOnLoadWithoutBackgroundLoad(Component avatar)
+        {
+            return () =>
+            {
+                List<Object> gos = new List<Object>();
+                AudioSource[] audioSources = avatar.GetComponentsInChildren<AudioSource>(true);
+
+                foreach (var audioSource in audioSources)
+                {
+                    if (audioSource.clip && audioSource.clip.loadType == AudioClipLoadType.DecompressOnLoad && !audioSource.clip.loadInBackground)
+                    {
+                        gos.Add(audioSource.gameObject);
+                    }
+                }
+
+                Selection.objects = gos.Count > 0 ? gos.ToArray() : new Object[] { avatar.gameObject };
+            };
+        }
+
         private void VerifyAvatarMipMapStreaming(Component avatar)
         {
+            List<TextureImporter> badTextureImporters = new List<TextureImporter>();
             List<Object> badTextures = new List<Object>();
-            foreach (Renderer r in avatar.GetComponentsInChildren<Renderer>(true))
+            foreach (Renderer r in avatar.gameObject.GetComponentsInChildrenExcludingEditorOnly<Renderer>(true))
             {
                 foreach (Material m in r.sharedMaterials)
                 {
@@ -564,12 +2492,15 @@ namespace VRC.SDKBase.Editor
                             continue;
                         TextureImporter importer = AssetImporter.GetAtPath(path) as TextureImporter;
                         if (importer != null && importer.mipmapEnabled && !importer.streamingMipmaps)
-                            badTextures.Add(importer);
+                        {
+                            badTextureImporters.Add(importer);
+                            badTextures.Add(t);
+                        }
                     }
                 }
             }
 
-            if (badTextures.Count == 0)
+            if (badTextureImporters.Count == 0)
                 return;
 
             _builder.OnGUIError(avatar, "This avatar has mipmapped textures without 'Streaming Mip Maps' enabled.",
@@ -577,12 +2508,37 @@ namespace VRC.SDKBase.Editor
                 () =>
                 {
                     List<string> paths = new List<string>();
-                    foreach (Object o in badTextures)
+                    foreach (TextureImporter t in badTextureImporters)
                     {
-                        TextureImporter t = (TextureImporter) o;
                         Undo.RecordObject(t, "Set Mip Map Streaming");
                         t.streamingMipmaps = true;
                         t.streamingMipmapsPriority = 0;
+                        EditorUtility.SetDirty(t);
+                        paths.Add(t.assetPath);
+                    }
+
+                    AssetDatabase.ForceReserializeAssets(paths);
+                    AssetDatabase.Refresh();
+                });
+        }
+        
+        private void VerifyMaxTextureSize(Component avatar)
+        {
+            var renderers = avatar.gameObject.GetComponentsInChildrenExcludingEditorOnly<Renderer>(true);
+            List<TextureImporter> badTextureImporters = VRCSdkControlPanel.GetOversizeTextureImporters(renderers);
+
+            if (badTextureImporters.Count == 0)
+                return;
+
+            _builder.OnGUIError(avatar, $"This avatar has textures bigger than {VRCSdkControlPanel.MAX_SDK_TEXTURE_SIZE}. Please reduce them to save memory for users.",
+                null,
+                () =>
+                {
+                    List<string> paths = new List<string>();
+                    foreach (TextureImporter t in badTextureImporters)
+                    {
+                        Undo.RecordObject(t, $"Set Max Texture Size to {VRCSdkControlPanel.MAX_SDK_TEXTURE_SIZE}");
+                        t.maxTextureSize = VRCSdkControlPanel.MAX_SDK_TEXTURE_SIZE;
                         EditorUtility.SetDirty(t);
                         paths.Add(t.assetPath);
                     }
@@ -597,7 +2553,9 @@ namespace VRC.SDKBase.Editor
             bool hasHead;
             bool hasFeet;
             bool hasHands;
+#if VRC_SDK_VRCSDK2
             bool hasThreeFingers;
+#endif
             bool correctSpineHierarchy;
             bool correctLeftArmHierarchy;
             bool correctRightArmHierarchy;
@@ -629,22 +2587,6 @@ namespace VRC.SDKBase.Editor
             Transform rThumb = anim.GetBoneTransform(HumanBodyBones.RightThumbProximal);
             Transform rIndex = anim.GetBoneTransform(HumanBodyBones.RightIndexProximal);
             Transform rMiddle = anim.GetBoneTransform(HumanBodyBones.RightMiddleProximal);
-
-#if VRC_SDK_VRCSDK2
-            // Finger test, only for v2
-            hasThreeFingers = null != lThumb && null != lIndex && null != lMiddle && null != rThumb && null != rIndex &&
-                              null != rMiddle;
-
-            if (!hasThreeFingers)
-            {
-                // although its only a warning, we return here because the rest
-                // of the analysis is for VR IK
-                _builder.OnGUIWarning(ad,
-                    "Thumb, Index, and Middle finger bones are not mapped, Full-Body IK will be disabled.",
-                    delegate { Selection.activeObject = anim.gameObject; }, null);
-                status = false;
-            }
-#endif
 
             Transform pelvis = anim.GetBoneTransform(HumanBodyBones.Hips);
             Transform chest = anim.GetBoneTransform(HumanBodyBones.Chest);
@@ -816,7 +2758,7 @@ namespace VRC.SDKBase.Editor
             return found;
         }
 
-        protected void CheckAvatarMeshesForLegacyBlendShapesSetting(Component avatar)
+        private void CheckAvatarMeshesForLegacyBlendShapesSetting(Component avatar)
         {
             if (LegacyBlendShapeNormalsPropertyInfo == null)
             {
@@ -873,10 +2815,7 @@ namespace VRC.SDKBase.Editor
                     continue;
                 }
 
-                if (!incorrectlyConfiguredMeshes.Contains(avatarMesh))
-                {
-                    incorrectlyConfiguredMeshes.Add(avatarMesh);
-                }
+                incorrectlyConfiguredMeshes.Add(avatarMesh);
             }
 
             return incorrectlyConfiguredMeshes;
@@ -925,7 +2864,7 @@ namespace VRC.SDKBase.Editor
             }
         }
 
-        protected void CheckAvatarMeshesForMeshReadWriteSetting(Component avatar)
+        private void CheckAvatarMeshesForMeshReadWriteSetting(Component avatar)
         {
             // Get all of the meshes used by skinned mesh renderers.
             HashSet<Mesh> avatarMeshes = GetAllMeshesInGameObjectHierarchy(avatar.gameObject);
@@ -969,10 +2908,7 @@ namespace VRC.SDKBase.Editor
                     continue;
                 }
 
-                if (!incorrectlyConfiguredMeshes.Contains(avatarMesh))
-                {
-                    incorrectlyConfiguredMeshes.Add(avatarMesh);
-                }
+                incorrectlyConfiguredMeshes.Add(avatarMesh);
             }
 
             return incorrectlyConfiguredMeshes;
@@ -1025,7 +2961,7 @@ namespace VRC.SDKBase.Editor
         {
             HashSet<Mesh> avatarMeshes = new HashSet<Mesh>();
             foreach (SkinnedMeshRenderer avatarSkinnedMeshRenderer in avatar
-                .GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                .GetComponentsInChildrenExcludingEditorOnly<SkinnedMeshRenderer>(true))
             {
                 if (avatarSkinnedMeshRenderer == null)
                 {
@@ -1046,7 +2982,7 @@ namespace VRC.SDKBase.Editor
                 avatarMeshes.Add(skinnedMesh);
             }
 
-            foreach (MeshFilter avatarMeshFilter in avatar.GetComponentsInChildren<MeshFilter>(true))
+            foreach (MeshFilter avatarMeshFilter in avatar.GetComponentsInChildrenExcludingEditorOnly<MeshFilter>(true))
             {
                 if (avatarMeshFilter == null)
                 {
@@ -1068,7 +3004,7 @@ namespace VRC.SDKBase.Editor
             }
 
             foreach (ParticleSystemRenderer avatarParticleSystemRenderer in avatar
-                .GetComponentsInChildren<ParticleSystemRenderer>(true))
+                .GetComponentsInChildrenExcludingEditorOnly<ParticleSystemRenderer>(true))
             {
                 if (avatarParticleSystemRenderer == null)
                 {
@@ -1096,7 +3032,7 @@ namespace VRC.SDKBase.Editor
             return avatarMeshes;
         }
 
-        protected void OpenAnimatorControllerWindow(object animatorController)
+        private void OpenAnimatorControllerWindow(object animatorController)
         {
             Assembly asm = Assembly.Load("UnityEditor.Graphs");
             Module editorGraphModule = asm.GetModule("UnityEditor.Graphs.dll");
@@ -1106,7 +3042,7 @@ namespace VRC.SDKBase.Editor
             if (propInfo != null) propInfo.SetValue(animatorWindow, animatorController, null);
         }
 
-        protected static void ShowRestrictedComponents(IEnumerable<Component> componentsToRemove)
+        private static void ShowRestrictedComponents(IEnumerable<Component> componentsToRemove)
         {
             List<Object> gos = new List<Object>();
             foreach (Component c in componentsToRemove)
@@ -1114,7 +3050,7 @@ namespace VRC.SDKBase.Editor
             Selection.objects = gos.ToArray();
         }
 
-        protected static void FixRestrictedComponents(IEnumerable<Component> componentsToRemove)
+        private static void FixRestrictedComponents(IEnumerable<Component> componentsToRemove)
         {
             if (!(componentsToRemove is List<Component> list)) return;
             for (int v = list.Count - 1; v > -1; v--)
@@ -1123,25 +3059,15 @@ namespace VRC.SDKBase.Editor
             }
         }
 
-        public static void SelectAvatar(VRC_AvatarDescriptor avatar)
+        private static void SetLayerMaskFromControllerInternal(SerializedProperty layer)
         {
-            if (VRCSdkControlPanel.window != null)
-                _selectedAvatar = avatar;
+            var method = typeof(AvatarDescriptorEditor3).GetMethod("SetLayerMaskFromController",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            method?.Invoke(null, new object[] { layer });
+            layer.serializedObject.ApplyModifiedProperties();
         }
 
-
-        List<Transform> FindBonesBetween(Transform top, Transform bottom)
-        {
-            List<Transform> list = new List<Transform>();
-            if (top == null || bottom == null) return list;
-            Transform bt = top.parent;
-            while (bt != bottom && bt != null)
-            {
-                list.Add(bt);
-                bt = bt.parent;
-            }
-
-            return list;
-        }
+        #endregion
     }
 }
+#endif
